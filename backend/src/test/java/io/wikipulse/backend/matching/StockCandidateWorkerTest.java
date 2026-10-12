@@ -1,0 +1,108 @@
+package io.wikipulse.backend.matching;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import java.util.List;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+/**
+ * 폴러 계약 (S15P21A609-67): 클러스터 하나가 실패해도 나머지는 계속 처리한다.
+ */
+@ExtendWith(MockitoExtension.class)
+class StockCandidateWorkerTest {
+
+    @Mock
+    StockCandidateService service;
+    @Mock
+    CandidateRepository repository;
+
+    final CandidateProperties props = new CandidateProperties();
+
+    @Test
+    void 대상_선택에_스냅샷_상한을_넘긴다() {
+        // 🔴 batchSize 만으로는 비용이 안 묶인다 — 폴마다 대상을 새로 고르므로 반복하면
+        //    미처리 클러스터 전체(운영 4,474개)를 훑고, 후보마다 LLM 검증이 따라붙는다.
+        props.getScheduler().setBatchSize(7);
+        props.getScheduler().setTopPerSnapshot(3);
+        when(repository.pendingClusterIds(anyInt(), anyInt(), any(), any())).thenReturn(List.of());
+
+        new StockCandidateWorker(service, repository, props).pollAndGenerate();
+
+        verify(repository).pendingClusterIds(7, 3, "", "");
+    }
+
+    @Test
+    void 기본_상한이_무제한이_아니고_요약과_같다() {
+        // ⚠️ 0(무제한)으로 돌아가면 켜는 순간 크레딧을 넘긴다.
+        // 🔴 요약 상한과 값이 다르면 같은 화면에서 요약은 있는데 종목이 없거나 그 반대가 생긴다.
+        CandidateProperties fresh = new CandidateProperties();
+        assertThat(fresh.getScheduler().getTopPerSnapshot()).isPositive();
+        assertThat(fresh.getScheduler().getTopPerSnapshot())
+                .isEqualTo(fresh.getSummary().getTopPerSnapshot());
+    }
+
+    @Test
+    void 설정의_snapshot_days_를_대상_선택에_넘긴다() {
+        // 안 넘기면 시연일만 채우려던 의도가 조용히 무시되고 최신 스냅샷부터 크레딧이 나간다
+        // (S15P21A609-215).
+        props.getScheduler().setSnapshotDays("2026-07-17,2026-07-25");
+        when(repository.pendingClusterIds(anyInt(), anyInt(), any(), any())).thenReturn(List.of());
+
+        new StockCandidateWorker(service, repository, props).pollAndGenerate();
+
+        verify(repository).pendingClusterIds(anyInt(), anyInt(), any(), eq("2026-07-17,2026-07-25"));
+    }
+
+    @Test
+    void 기본_snapshot_days_는_전체이고_요약과_같다() {
+        CandidateProperties fresh = new CandidateProperties();
+        assertThat(fresh.getScheduler().getSnapshotDays()).isEmpty();
+        assertThat(fresh.getScheduler().getSnapshotDays())
+                .isEqualTo(fresh.getSummary().getSnapshotDays());
+    }
+
+    @Test
+    void 기본_source_는_전체이고_요약과_같다() {
+        // 🔴 한쪽만 좁히면 같은 화면에서 요약은 있는데 종목이 없거나 그 반대가 생긴다.
+        // ⚠️ 기본값이 빈 값이어야 이 변경이 기존 동작을 안 바꾼다.
+        CandidateProperties fresh = new CandidateProperties();
+        assertThat(fresh.getScheduler().getSource()).isEmpty();
+        assertThat(fresh.getScheduler().getSource())
+                .isEqualTo(fresh.getSummary().getSource());
+    }
+
+    @Test
+    void 한_클러스터가_실패해도_나머지는_계속_처리된다() {
+        when(repository.pendingClusterIds(anyInt(), anyInt(), any(), any()))
+                .thenReturn(List.of(1L, 2L, 3L));
+        when(service.generateFor(1L)).thenReturn(new StockCandidateService.Result(1L, 1, 1, 1));
+        when(service.generateFor(2L)).thenThrow(new RuntimeException("GMS 오류"));
+        when(service.generateFor(3L)).thenReturn(new StockCandidateService.Result(3L, 1, 1, 1));
+
+        new StockCandidateWorker(service, repository, props).pollAndGenerate();
+
+        // 2L 에서 던져도 예외가 폴러 밖으로 새지 않고 1L·3L 모두 시도된다.
+        verify(service).generateFor(1L);
+        verify(service).generateFor(2L);
+        verify(service).generateFor(3L);
+    }
+
+    @Test
+    void 대상이_없으면_아무것도_하지_않는다() {
+        when(repository.pendingClusterIds(anyInt(), anyInt(), any(), any())).thenReturn(List.of());
+
+        new StockCandidateWorker(service, repository, props).pollAndGenerate();
+
+        verify(service, never()).generateFor(anyLong());
+    }
+}

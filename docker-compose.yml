@@ -1,0 +1,353 @@
+# WikiPulse 로컬 개발 스택 (S15P21A609-63)
+#
+# 팀원마다 파이썬·JDK·PostgreSQL 설치가 달라 생기는 의존성 문제를 없앤다.
+# `docker compose up` 하나로 전원이 같은 환경을 띄운다.
+#
+#   docker compose up -d postgres kafka        # 인프라만 (백엔드·파이썬 로컬 개발)
+#   docker compose up -d                        # 전체 스택
+#   docker compose --profile pipeline up -d     # 파이프라인(producer·spark)까지
+#   docker compose --profile gdelt up -d        # GDELT 수집(HDFS namenode·datanode)까지
+#   docker compose down                         # 정지
+#
+# EC2 실물 구축(S15P21A609-26·-29·-28)과 별개다. 이건 개발용이라 전부 단일
+# 인스턴스·복제 1이고 운영 구성과 다르다. HDFS 도 개발용 단일 datanode 라
+# 2노드·복제 2 인 EC2 구성(S15P21A609-28)과 다르다.
+
+name: wikipulse
+
+services:
+  # ---------------------------------------------------------------- 인프라
+  postgres:
+    build:
+      context: .
+      dockerfile: docker/postgres/Dockerfile
+    container_name: wikipulse-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-wikipulse}
+      POSTGRES_USER: ${POSTGRES_USER:-wikipulse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-wikipulse}
+      # pgserver 에서 겪은 시간대 문제를 피하려고 UTC 로 못박는다.
+      TZ: UTC
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-wikipulse} -d ${POSTGRES_DB:-wikipulse}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: wikipulse-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: INTERNAL://:29092,HOST://:9092,CONTROLLER://:9093
+      # 컨테이너 안(spark·producer)은 kafka:29092, 호스트는 localhost:9092.
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168  # 명세 §5 재처리 창 7일
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  # ---------------------------------------------------------------- 서비스
+  migrate:
+    build:
+      context: ./docker/migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-wikipulse}
+      POSTGRES_USER: ${POSTGRES_USER:-wikipulse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-wikipulse}
+    volumes:
+      - ./db:/db:ro
+    restart: "no"
+
+  backend:
+    build:
+      context: ./backend
+    container_name: wikipulse-backend
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-wikipulse}
+      DB_USER: ${POSTGRES_USER:-wikipulse}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-wikipulse}
+      # This compose stack serves local HTTP; production defaults to Secure cookies.
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      SESSION_TIMEOUT: ${SESSION_TIMEOUT:-24h}
+      # 매칭·검증·요약 워커 (명세 §6.3, §3.2 7번). 셋 다 기본 꺼짐이고 따로 켠다 —
+      # 스케줄러는 종목 임베딩 전량 적재 후, 검증은 PENDING 후보가 쌓인 뒤다.
+      # ⚠️ 여기서 전달하지 않으면 .env 에 값을 넣어도 컨테이너 안에 안 들어간다.
+      #    애플리케이션 기본값(false·빈 키)으로 조용히 떨어져서 "켰는데 아무 일도
+      #    안 일어난다"로 보인다. infra/service/compose.yaml 과 같은 목록이다.
+      GMS_KEY: ${GMS_KEY:-}
+      WIKIPULSE_MATCHING_SCHEDULER_ENABLED: ${WIKIPULSE_MATCHING_SCHEDULER_ENABLED:-false}
+      WIKIPULSE_MATCHING_VERIFICATION_ENABLED: ${WIKIPULSE_MATCHING_VERIFICATION_ENABLED:-false}
+      WIKIPULSE_MATCHING_SUMMARY_ENABLED: ${WIKIPULSE_MATCHING_SUMMARY_ENABLED:-false}
+      WIKIPULSE_MATCHING_SUMMARY_TOPPERSNAPSHOT: ${WIKIPULSE_MATCHING_SUMMARY_TOPPERSNAPSHOT:-10}
+      WIKIPULSE_MATCHING_SCHEDULER_TOPPERSNAPSHOT: ${WIKIPULSE_MATCHING_SCHEDULER_TOPPERSNAPSHOT:-10}
+      # 대상 출처 한정 (S15P21A609-168). 빈 값 = 전체. 🔴 아래와 같은 값이어야 한다.
+      WIKIPULSE_MATCHING_SCHEDULER_SOURCE: ${WIKIPULSE_MATCHING_SCHEDULER_SOURCE:-}
+      WIKIPULSE_MATCHING_SUMMARY_SOURCE: ${WIKIPULSE_MATCHING_SUMMARY_SOURCE:-}
+      WIKIPULSE_MATCHING_SCHEDULER_SNAPSHOT_DAYS: ${WIKIPULSE_MATCHING_SCHEDULER_SNAPSHOT_DAYS:-}
+      WIKIPULSE_MATCHING_SUMMARY_SNAPSHOT_DAYS: ${WIKIPULSE_MATCHING_SUMMARY_SNAPSHOT_DAYS:-}
+      # 같은 model 로 요약 저장에 실패해도 되는 횟수 (S15P21A609-182).
+      # 🔴 0 이하 = 무제한. 켜지 말 것 — 저장 못 하는 클러스터를 매 폴 다시 집는다.
+      WIKIPULSE_MATCHING_SUMMARY_MAXATTEMPTS: ${WIKIPULSE_MATCHING_SUMMARY_MAXATTEMPTS:-3}
+      # 하루 LLM 호출 상한 (S15P21A609-191). 🔴 0 이하 = 무제한, 켜지 말 것.
+      WIKIPULSE_MATCHING_BUDGET_SUMMARYCALLS: ${WIKIPULSE_MATCHING_BUDGET_SUMMARYCALLS:-100}
+      WIKIPULSE_MATCHING_BUDGET_VERIFICATIONCALLS: ${WIKIPULSE_MATCHING_BUDGET_VERIFICATIONCALLS:-300}
+      # 문서 표시용 한국어 제목 채우기 워커 (S15P21A609-205, V20). 위 GMS 워커들과 독립이다 —
+      # 크레딧을 쓰지 않고(위키미디어 무료) GMS 키도 필요 없다. 🔴 기본 꺼짐이며
+      # **켜는 것이 곧 백필**이다: cluster_member 에 편입된 enwiki 문서 중 아직 조회 안 한
+      # 것을 훑어 wiki_page.title_ko 를 채운다. 끄면 화면이 영문 제목으로 떨어질 뿐이다.
+      WIKIPULSE_PAGETITLE_ENABLED: ${WIKIPULSE_PAGETITLE_ENABLED:-false}
+      # 🔴 폴당 위키 요청 수는 이 값 / 50 이다 — langlinks 는 한 요청에 제목 50개까지고
+      #    51개부터는 잘림이 아니라 toomanyvalues 에러다(2026-09-22 실측).
+      #    기본 500 이면 폴당 10 요청으로 resilience4j wikipedia RateLimiter(초당 10)와 같은 자릿수.
+      WIKIPULSE_PAGETITLE_BATCHSIZE: ${WIKIPULSE_PAGETITLE_BATCHSIZE:-500}
+      # 2단 폴백 — Azure Translator (S15P21A609-205). ko.wikipedia 대응이 없는 문서만 번역한다.
+      # 🔴 키는 저장소에 없다. 서버 .env 에만 둔다. 비어 있으면 번역을 건너뛰고 영문 표시다.
+      # 🔴 번역 결과는 표시·검색 전용이며 ko.wikipedia 정식 제목이 아니다 — 위키 링크에 쓰지 않는다.
+      AZURE_TRANSLATOR_KEY:       ${AZURE_TRANSLATOR_KEY:-}
+      AZURE_TRANSLATOR_ENDPOINT:  ${AZURE_TRANSLATOR_ENDPOINT:-https://api.cognitive.microsofttranslator.com}
+      AZURE_TRANSLATOR_REGION:    ${AZURE_TRANSLATOR_REGION:-}
+      # F0 는 월 200만 자다. 한 폴에서 번역할 문서 수 상한 — 위키 조회와 별개 축이다.
+      AZURE_TRANSLATOR_BATCHSIZE: ${AZURE_TRANSLATOR_BATCHSIZE:-200}
+      WIKIPULSE_MATCHING_GMS_VERIFICATIONMODEL: ${WIKIPULSE_MATCHING_GMS_VERIFICATIONMODEL:-gpt-5.4-nano}
+      WIKIPULSE_MATCHING_GMS_SUMMARYMODEL: ${WIKIPULSE_MATCHING_GMS_SUMMARYMODEL:-claude-sonnet-4-5-20250929}
+    ports:
+      - "8080:8080"
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: wikipulse-frontend
+    environment:
+      VITE_DATA_SOURCE: ${VITE_DATA_SOURCE:-api}
+      # 브라우저는 Vite와 같은 origin으로 요청하고 Vite가 backend 컨테이너로 전달한다.
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api/v1}
+      VITE_API_PROXY_TARGET: http://backend:8080
+    ports:
+      - "5174:5174"
+    depends_on:
+      - backend
+
+  # ---------------------------------------------------------------- 파이프라인 (선택)
+  producer:
+    build:
+      context: ./data-pipeline
+    container_name: wikipulse-producer
+    profiles: ["pipeline"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: wiki.edits
+      WIKIS: ${WIKIS:-enwiki}
+      # 값이 없으면 producer 가 기동 때 안내를 띄우고 멈춘다(config.py).
+      # 여기서 강제하면 producer 를 안 쓸 때도 compose 전체가 막힌다.
+      CONTACT_EMAIL: ${CONTACT_EMAIL:-}
+
+  # 시간별 조회수 적재 -> 후보 대기 재판정 (S15P21A609-135).
+  #
+  # 🔴 **이게 없으면 LIVE 는 확정을 못 낸다.** 편집 스트림에 조회수가 없어서 판정이
+  #     전부 후보 대기로 남고(S15P21A609-126·-128), 그 대기를 깨우는 건 조회수 도착뿐이다.
+  #
+  # 받는 양은 대기 목록이 정한다 — 전수 적재는 시간당 149만 행이라 못 한다(-127 실측).
+  # 한 주기가 대기 중인 시간·문서만 골라 받고 바로 재판정한다.
+  #
+  # ⚠️ 주기가 15분인 이유: 파일은 매시 한 번 나오지만 공개 시각이 5~19분 흔들린다
+  #    (2026-09-18 실측). 한 시간에 한 번만 보면 최대 한 시간을 그냥 기다린다.
+  #    중복 실행은 PostgreSQL advisory lock 이 막으므로 여러 번 떠도 하나만 돈다.
+  live-cycle:
+    build:
+      context: ./data-pipeline
+    container_name: wikipulse-live-cycle
+    profiles: ["pipeline"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-wikipulse}:${POSTGRES_PASSWORD:-wikipulse}@postgres:5432/${POSTGRES_DB:-wikipulse}
+      DUMP_CACHE: /data/cache
+      PAGEVIEW_HOURLY_OUT: /data/pageview-hourly
+      # Wikimedia 는 연락처 없는 User-Agent 를 차단한다 (batch/ingest.py user_agent).
+      CONTACT_EMAIL: ${CONTACT_EMAIL:-}
+    volumes:
+      - pageview-cache:/data
+    command: ["python", "-m", "spike.live_cycle", "--loop", "--interval", "900"]
+
+  # Kafka -> 문서별 편집 윈도우 집계 (S15P21A609-38).
+  #
+  # ~~🔴 `SINK=spike` 는 이 이미지에서 못 돈다 (psycopg 가 안 깔린다)~~ → 해소했다
+  #    (2026-09-18, S15P21A609-136). 공식 apache/spark 이미지의 파이썬이 3.8.10 이라
+  #    psycopg 3.3.5 가 안 깔리던 문제였고, 파이썬 3.11 자체 이미지로 바꿨다.
+  #    ⚠️ **EC2 Master·Worker 도 같은 이미지로 같이 바꿔야 한다** — 드라이버와 워커의
+  #    파이썬이 갈리면 파이썬 워커가 뜨는 순간 executor 가 죽는다. 절차는 docker/README.md.
+  spark:
+    # ~~apache/spark:3.5.3-python3~~ → 파이썬 3.11 자체 이미지 (S15P21A609-136).
+    # 공식 이미지의 파이썬이 3.8.10 이라 psycopg 3.3.5 가 안 깔렸고, 그래서 SINK=spike 가
+    # 못 돌았다. 이유와 EC2 적용 주의는 docker/spark/Dockerfile 에 있다.
+    build:
+      context: ./docker/spark
+    image: wikipulse-spark:py311
+    container_name: wikipulse-spark
+    profiles: ["pipeline"]
+    # ~~named volume 권한 때문에 root 로 우회~~ → 이 이미지는 기본 사용자가 root 라
+    # 따로 지정할 필요가 없다. (공식 이미지는 UID 185(spark)였다.)
+    depends_on:
+      kafka:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: wiki.edits
+      # 싱크. 기본은 여태와 같은 콘솔이다.
+      # SINK=spike 면 판정까지 가서 spike(source='live') 에 적재하고, 조회수가 없는
+      # 윈도우는 spike_candidate 에 대기로 쌓는다 (S15P21A609-100·-128).
+      # ~~그 경로는 psycopg 가 없어서 못 돈다~~ → 이미지를 바꿔 해소했다 (-136).
+      SINK: ${SPARK_SINK:-console}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-wikipulse}:${POSTGRES_PASSWORD:-wikipulse}@postgres:5432/${POSTGRES_DB:-wikipulse}
+      # 🔴 **SINK=spike 면 정각 tumbling 으로 흘린다** (S15P21A609-128·-136).
+      #    조회수는 시간 버킷이라 윈도우 시작이 정각이어야 1:1 로 붙는다. 기본 슬라이드
+      #    5분으로 흘리면 한 문서가 시간당 12개 대기를 만들고 그중 정각 하나만 확정
+      #    후보가 된다 — 나머지 11개는 만료될 때까지 자리만 차지한다.
+      #    2026-09-18 로컬 실측: 문서 2개가 대기 24건(12 × 2)을 만들었다.
+      WINDOW_SIZE: ${SPARK_WINDOW_SIZE:-1 hour}
+      SLIDE_SIZE: ${SPARK_SLIDE_SIZE:-1 hour}
+    volumes:
+      - ./data-pipeline/streaming:/opt/app/streaming:ro
+      # SINK=spike 가 타고 들어가는 모듈들. 콘솔 싱크는 안 쓰지만 마운트만으로는
+      # 아무것도 안 바뀐다. streaming/live_spike.py -> spike.runtime ->
+      # batch.historical_windows · producer.normalize 순으로 필요하다.
+      - ./data-pipeline/spike:/opt/app/spike:ro
+      - ./data-pipeline/batch:/opt/app/batch:ro
+      - ./data-pipeline/producer:/opt/app/producer:ro
+      - spark-checkpoint:/tmp/wikipulse-checkpoint
+    working_dir: /opt/app
+    command: >
+      spark-submit
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3
+        --conf spark.jars.ivy=/tmp/ivy
+        streaming/edit_windows.py
+
+  # ------------------------------------------------------- GDELT 수집 (선택)
+  # 개발용 단일노드 HDFS. GDELT GKG 원본을 여기에 적재해 WebHDFS 싱크를
+  # 로컬에서 실제로 검증한다 (S15P21A609-32). EC2 실물(-28)은 2노드·복제 2.
+  #
+  # 공식 apache/hadoop 이미지는 env 로 하둡 설정 파일을 만든다.
+  # `CORE-SITE.XML_<속성>` -> core-site.xml, `HDFS-SITE.XML_<속성>` -> hdfs-site.xml.
+  #
+  # WebHDFS 쓰기는 namenode(9870)가 클라이언트를 datanode 호스트로 리다이렉트한다.
+  # gdelt-producer 를 compose 네트워크 안에서 돌리면 `hdfs-datanode` 가 그대로
+  # 해석돼 매끄럽다. 호스트에서 직접 돌리면 그 호스트명을 못 찾는다 — README 참고.
+  hdfs-namenode:
+    image: apache/hadoop:3.4.1
+    container_name: wikipulse-hdfs-namenode
+    hostname: hdfs-namenode
+    profiles: ["gdelt"]
+    command: ["hdfs", "namenode"]
+    ports:
+      - "9870:9870"   # NameNode Web UI / WebHDFS 진입점
+    environment:
+      CORE-SITE.XML_fs.defaultFS: hdfs://hdfs-namenode:8020
+      HDFS-SITE.XML_dfs.replication: "1"
+      HDFS-SITE.XML_dfs.namenode.name.dir: file:///data/name
+      HDFS-SITE.XML_dfs.webhdfs.enabled: "true"
+      # 이미지 starter.sh 가 이 디렉터리가 "없을" 때만 자동 포맷한다.
+      # 그래서 볼륨은 name.dir(/data/name)이 아니라 그 부모(/data)에 건다 —
+      # name.dir 자체에 걸면 디렉터리가 늘 존재해 포맷이 영영 안 돈다.
+      # /data 는 starter.sh 가 chmod o+rwx 해줘 hadoop 유저가 쓸 수 있다.
+      ENSURE_NAMENODE_DIR: /data/name
+    volumes:
+      - hdfs-namenode:/data
+    healthcheck:
+      # 세이프모드가 풀려야(단일 datanode 가 블록 보고를 마쳐야) 쓰기가 된다.
+      # 그 전까지는 unhealthy 로 두어 producer 의 depends_on 이 기다리게 한다.
+      test: ["CMD-SHELL", "hdfs dfsadmin -safemode get | grep -q 'Safe mode is OFF'"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
+
+  hdfs-datanode:
+    image: apache/hadoop:3.4.1
+    container_name: wikipulse-hdfs-datanode
+    hostname: hdfs-datanode
+    profiles: ["gdelt"]
+    command: ["hdfs", "datanode"]
+    depends_on:
+      - hdfs-namenode
+    environment:
+      CORE-SITE.XML_fs.defaultFS: hdfs://hdfs-namenode:8020
+      HDFS-SITE.XML_dfs.replication: "1"
+      HDFS-SITE.XML_dfs.datanode.data.dir: file:///data/dfs
+      HDFS-SITE.XML_dfs.webhdfs.enabled: "true"
+    volumes:
+      - hdfs-datanode:/data
+
+  # GDELT GKG 15분 폴링 -> HDFS 적재 producer (S15P21A609-32).
+  # 파이프라인 이미지(requests 포함)를 재사용하고 gdelt 소스는 마운트한다
+  # (spark 가 streaming 을 마운트하는 것과 같은 패턴 — 코드 바꿔도 재빌드 불필요).
+  # compose 네트워크 안에서 돌아 WebHDFS 의 datanode 리다이렉트(hdfs-datanode)가
+  # 그대로 해석된다. namenode 가 healthy(세이프모드 OFF)가 된 뒤 시작한다.
+  gdelt-producer:
+    build:
+      context: ./data-pipeline
+    container_name: wikipulse-gdelt-producer
+    profiles: ["gdelt"]
+    depends_on:
+      hdfs-namenode:
+        condition: service_healthy
+    environment:
+      GDELT_SINK: webhdfs
+      WEBHDFS_URL: http://hdfs-namenode:9870
+      WEBHDFS_USER: hadoop
+      HDFS_BASE_PATH: /gdelt/gkg
+      GDELT_SELFHEAL_HOURS: ${GDELT_SELFHEAL_HOURS:-6}
+      GDELT_GAPS_PATH: /app/gdelt-data/gaps.json
+      CONTACT_EMAIL: ${CONTACT_EMAIL:-}
+    volumes:
+      # 소스는 읽기 전용 마운트(코드 바꿔도 재빌드 불필요).
+      - ./data-pipeline/gdelt:/app/gdelt:ro
+      # 결손 기록(gaps.json)은 named 볼륨에 둔다 — down/재생성 후에도 유지되고,
+      # 필요하면 Spark 컨테이너가 같은 볼륨을 마운트해 읽을 수 있다. (영속화가
+      # 목적이면 이후 HDFS 로 옮기는 것도 대안 — gdelt/README 참고.)
+      - gdelt-gaps:/app/gdelt-data
+    command: ["python", "-m", "gdelt.producer"]
+
+volumes:
+  # 받은 시간별 덤프 캐시와 샤드. 45.7 MB/시간이라 컨테이너 재기동마다 다시 받지 않게 둔다.
+  pageview-cache:
+  postgres-data:
+  kafka-data:
+  spark-checkpoint:
+  hdfs-namenode:
+  hdfs-datanode:
+  gdelt-gaps:

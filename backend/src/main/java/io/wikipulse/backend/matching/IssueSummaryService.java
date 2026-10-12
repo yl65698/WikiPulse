@@ -1,0 +1,174 @@
+package io.wikipulse.backend.matching;
+
+import java.util.Optional;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+/**
+ * 이슈 요약 writer + 라이프사이클 전이 (S15P21A609-119). issue_cluster.status 를
+ * DETECTED → VERIFYING → CONFIRMED 로 전이하고, 대표 텍스트 + GDELT 기관명으로 한국어 요약을
+ * 생성·멱등 저장한다.
+ *
+ * <p>🔴 <b>이 서비스가 라이프사이클 전이를 owns 한다.</b> 파이프라인(-67 후보 생성 / -68 종목 검증)은
+ * cluster_stock.check_state 만 다루고 issue_cluster.status 는 생성 시 DETECTED 로 박은 뒤 건드리지
+ * 않는다(-119 조사 결론). 여기가 유일한 status 전이 지점이다.
+ *
+ * <h2>클러스터 하나의 처리 ({@link #processCluster})</h2>
+ * <ol>
+ *   <li>DISCARDED·CONFIRMED 는 종착 — 건너뛴다(멱등).</li>
+ *   <li>DETECTED → VERIFYING (가드 UPDATE, 되돌리지 않음).</li>
+ *   <li>issue_report 가 없으면: 같은 issue_key 의 다른 스냅샷 요약을 <b>복사</b>(재사용)하거나,
+ *       없으면 LLM 으로 생성해 멱등 upsert. 근거 부족(sufficient_context=false)·스키마 실패면
+ *       저장하지 않고 VERIFYING 으로 남는다.</li>
+ *   <li>🔴 CONFIRMED 는 <b>요약 완료 AND 종목 검증 완료(cluster_stock PENDING 0)</b> 일 때만.
+ *       통과 종목 0개도 둘 다 끝난 뒤엔 정상 0-종목 CONFIRMED 다(§10 11번).</li>
+ * </ol>
+ *
+ * <p>전송 실패({@link UpstreamUnavailableException})는 잡지 않고 전파해 워커가 클러스터를 건너뛰고
+ * VERIFYING 으로 남긴다(다음 폴 재시도). GMS·GDELT 실패를 빈 정상 결과(CONFIRMED)로 만들지 않는다.
+ *
+ * <p>~~⚠️ 알려진 잔여 위험: sufficient_context=false 나 스키마 실패가 지속되면 같은 클러스터가
+ * 매 폴 요약을 재시도해 GMS 를 반복 호출한다. 실제 트리거는 좁다(위키피디아 도입부 대표 텍스트는
+ * 보통 충분하다).~~ → <b>해소</b> (S15P21A609-182, V11 {@code issue_summary_attempt}).
+ *
+ * <p>🔴 <b>"트리거가 좁다"는 틀렸다.</b> 2026-09-22 운영에서 전면적으로 터졌다 — 12분 로그에
+ * "근거 부족(요약 폐기)" 40건 · "생성=true" 0건, 51분간 확정 +10건에 5,414 크레딧(확정 1건당
+ * 약 541, 앞 구간은 약 107). 골든데이 클러스터는 멤버가 1개뿐이고 Clickstream 이 없어 대표
+ * 텍스트가 빈약하다 — 모델이 거절하는 것이 <b>정상</b>인 입력이었다. 즉 원인은 LLM 이 아니라
+ * 입력이고, 그래서 "좁은 트리거"라는 가정이 통째로 어긋났다(S15P21A609-183 과 같은 뿌리).
+ *
+ * <p>이제 저장 못 한 시도를 원장에 남기고, 같은 model 로 상한만큼 실패하면 대상 선택에서 뺀다.
+ * ⚠️ 상한에 닿아도 status 는 VERIFYING 이다 — 요약 없이 CONFIRMED 로 올리면 빈 요약이 화면에
+ * 분석 완료로 나간다.
+ */
+@Service
+public class IssueSummaryService {
+
+    private static final Logger log = LoggerFactory.getLogger(IssueSummaryService.class);
+
+    private static final String STATUS_DISCARDED = "DISCARDED";
+    private static final String STATUS_CONFIRMED = "CONFIRMED";
+    private static final String STATUS_DETECTED = "DETECTED";
+
+    private final IssueSummaryRepository repository;
+    private final VerificationRepository verificationRepository;
+    private final ClusterIssueText issueText;
+    private final IssueSummarizer summarizer;
+    private final CandidateProperties props;
+
+    public IssueSummaryService(
+            IssueSummaryRepository repository,
+            VerificationRepository verificationRepository,
+            ClusterIssueText issueText,
+            IssueSummarizer summarizer,
+            CandidateProperties props) {
+        this.repository = repository;
+        this.verificationRepository = verificationRepository;
+        this.issueText = issueText;
+        this.summarizer = summarizer;
+        this.props = props;
+    }
+
+    /** 처리 결과 요약. 로그·측정용. */
+    public record Result(long clusterId, boolean summarized, boolean reused, boolean confirmed) {
+
+        static Result skipped(long clusterId) {
+            return new Result(clusterId, false, false, false);
+        }
+    }
+
+    /**
+     * 클러스터 하나의 요약·상태 전이를 진행한다.
+     *
+     * <p>🔴 {@code @Transactional} 로 감싸지 않는다 — 단건 커밋이라 전송 실패가 중간에 나도 이미
+     * 올린 상태·요약이 커밋된 채 남아 다음 폴에서 이어진다(-68 오케스트레이션과 같은 관습).
+     *
+     * @throws UpstreamUnavailableException 요약 전송 실패 시 — 상태는 VERIFYING 으로 남고 전파된다
+     */
+    public Result processCluster(long clusterId) {
+        String status = repository.statusOf(clusterId);
+        if (status == null || STATUS_DISCARDED.equals(status) || STATUS_CONFIRMED.equals(status)) {
+            return Result.skipped(clusterId);
+        }
+
+        if (STATUS_DETECTED.equals(status)) {
+            repository.advanceToVerifying(clusterId);
+        }
+
+        boolean summarized = false;
+        boolean reused = false;
+        boolean reportPresent = repository.hasReport(clusterId);
+        if (!reportPresent) {
+            EnsureResult ensured = ensureSummary(clusterId); // 전송 실패는 전파
+            reportPresent = ensured.stored();
+            summarized = ensured.stored() && !ensured.reused();
+            reused = ensured.reused();
+        }
+
+        boolean confirmed = false;
+        if (reportPresent && repository.stockVerificationComplete(clusterId)) {
+            confirmed = repository.confirm(clusterId) > 0;
+        }
+
+        Result result = new Result(clusterId, summarized, reused, confirmed);
+        log.info("요약 cluster={} 생성={} 재사용={} 확정={}",
+                clusterId, summarized, reused, confirmed);
+        return result;
+    }
+
+    private record EnsureResult(boolean stored, boolean reused) {
+    }
+
+    /** issue_report 를 채운다: 같은 issue_key 재사용 → 없으면 LLM 생성. 저장 못 하면 stored=false. */
+    private EnsureResult ensureSummary(long clusterId) {
+        String issueKey = verificationRepository.issueKeyOf(clusterId);
+        String model = modelTag();
+
+        // 재사용: 같은 issue_key + 같은 model(=모델·프롬프트버전)의 다른 스냅샷 요약을 복사한다(LLM 0).
+        // issue_key 가 없는(V1 옛) 클러스터는 재사용을 못 써 아래 생성으로 내려간다.
+        if (issueKey != null) {
+            Optional<IssueSummaryRepository.PriorSummary> prior =
+                    repository.findPriorSummary(clusterId, issueKey, model);
+            if (prior.isPresent()) {
+                repository.upsertReport(clusterId, prior.get().summary(), prior.get().model());
+                log.debug("요약 재사용 cluster={} issueKey={}", clusterId, issueKey);
+                return new EnsureResult(true, true);
+            }
+        }
+
+        // 🔴 클러스터 id 로 부른다 — 요약도 그 시점 도입부로 만들어야 한다 (S15P21A609-129 1번).
+        // 제목 목록을 넘기던 옛 시그니처는 리플레이에서도 현재 도입부를 읽었다.
+        String text = issueText.build(clusterId);
+        String gdelt = String.join(", ",
+                verificationRepository.topOrgMentions(
+                        clusterId, props.getVerification().getOrgContextLimit()));
+
+        IssueSummarizer.Outcome outcome =
+                summarizer.summarize(new IssueSummarizer.Input(text, gdelt));
+        if (outcome.summary().isEmpty()) {
+            // 근거 부족·스키마 실패 — 저장하지 않는다(거부/할루시네이션 저장 방지). VERIFYING 유지.
+            // 🔴 **시도는 반드시 남긴다** (S15P21A609-182). 안 남기면 hasReport 가 계속 false 라
+            //    다음 폴에서 같은 클러스터를 또 집고, LLM 은 매번 호출되고 결과는 매번 버려진다.
+            repository.recordFailedAttempt(clusterId, model, outcome.failure().name());
+            log.info("요약 실패 기록 cluster={} 사유={}", clusterId, outcome.failure());
+            return new EnsureResult(false, false);
+        }
+        repository.upsertReport(clusterId, outcome.summary().get(), model);
+        return new EnsureResult(true, false);
+    }
+
+    /**
+     * issue_report.model 에 남길 모델 식별자. GMS Anthropic 모델 + 프롬프트 버전.
+     *
+     * <p>워커도 쓴다 — 대상 선택에서 "이미 같은 model 요약이 있어 재사용 가능한가"를 보기
+     * 때문이다(S15P21A609-165). 같은 문자열을 두 곳에서 따로 조립하면 조용히 갈린다.
+     */
+    String modelTag() {
+        // 🔴 요약 모델을 쓴다. -172 로 검증만 nano 로 내렸는데 여기서 검증 모델을 읽으면
+        //    요약 내용은 Sonnet 인데 태그만 nano 로 찍혀 재사용 키가 통째로 틀어진다.
+        //    입력 규칙도 넣는다(S15P21A609-213) — 도입부 앞 N문장으로 쓴 요약을 재사용하지 않게.
+        return props.getGms().getSummaryModel() + " (" + IssueSummarizer.PROMPT_VERSION
+                + "+" + IssueRepresentativeText.LLM_INPUT_VERSION + ")";
+    }
+}

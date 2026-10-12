@@ -1,0 +1,488 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "WikiPulse Pulse Map contract",
+    "version": "1.1.0-backend",
+    "description": "Spring PulseMap DTO contract as of 2026-09-15 (S15P21A609-74, -95, -97). Runtime pipeline deployment is separate. IDs are strings; missing node metrics remain null."
+  },
+  "servers": [
+    {
+      "url": "/api/v1"
+    }
+  ],
+  "paths": {
+    "/issues/snapshots": {
+      "get": {
+        "operationId": "listSnapshots",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "Z$"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "Z$"
+            }
+          },
+          {
+            "name": "source",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": ["live", "replay"]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Completed snapshots, including zero-cluster snapshots; unique by source and snapshotTs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/issues/map": {
+      "get": {
+        "operationId": "getPulseMap",
+        "parameters": [
+          {
+            "name": "snapshotTs",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "Z$"
+            }
+          },
+          {
+            "name": "source",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": ["live", "replay"]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Atomic graph from one completed snapshot; omitting timestamp selects latest LIVE, or latest replay when no LIVE exists. Edges refer only to nodes within the same cluster.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MapResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Requested snapshot does not exist; never substitute current data.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Snapshot": {
+        "type": "object",
+        "required": ["snapshotTs", "source", "clusterCount"],
+        "properties": {
+          "snapshotTs": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "Z$"
+          },
+          "source": {
+            "type": "string",
+            "enum": ["live", "replay"]
+          },
+          "clusterCount": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "SnapshotResponse": {
+        "type": "object",
+        "required": ["data"],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Snapshot"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "Node": {
+        "type": "object",
+        "required": [
+          "pageId",
+          "wiki",
+          "title",
+          "isSeed",
+          "editCount",
+          "views",
+          "editBaseline",
+          "viewBaseline",
+          "spikeScore",
+          "sizeScore",
+          "completeness",
+          "windowStart",
+          "windowEnd"
+        ],
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "wiki": {
+            "type": "string",
+            "pattern": "^[a-z-]+wiki$"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "titleKo": {
+            "type": "string",
+            "minLength": 1,
+            "nullable": true,
+            "description": "표시 전용 ko.wikipedia 대응 제목. ko 문서가 없으면 null이고 화면은 title(영문)로 떨어진다. title을 대체하지 않으며 위키백과 링크·식별자는 계속 title을 쓴다."
+          },
+          "titleKoFallback": {
+            "type": "string",
+            "minLength": 1,
+            "nullable": true,
+            "description": "표시 전용 기계 번역 제목(Azure Translator, en->ko). ko.wikipedia 정식 제목이 아니므로 위키 링크에 쓰지 않는다. 표시 우선순위는 titleKo > titleKoFallback > title."
+          },
+          "isSeed": {
+            "type": "boolean",
+            "description": "true면 최종 급증 관문을 직접 통과한 루트 문서 또는 생성 시각 동시성으로 편입된 새 사건 문서다. false면 Clickstream 이웃 중 사건기간 편집 재급증 기준을 통과한 기존 문서다. Wikidata는 멤버 편입 사유가 아니다."
+          },
+          "editCount": {
+            "type": "number",
+            "minimum": 0,
+            "nullable": true
+          },
+          "views": {
+            "type": "number",
+            "minimum": 0,
+            "nullable": true
+          },
+          "editBaseline": {
+            "type": "number",
+            "minimum": 0,
+            "nullable": true
+          },
+          "viewBaseline": {
+            "type": "number",
+            "minimum": 0,
+            "nullable": true
+          },
+          "spikeScore": {
+            "type": "number",
+            "minimum": 0,
+            "nullable": true
+          },
+          "sizeScore": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "nullable": true
+          },
+          "completeness": {
+            "type": "string",
+            "enum": ["complete", "pending", "unavailable"]
+          },
+          "windowStart": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "Z$"
+          },
+          "windowEnd": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "Z$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "Evidence": {
+        "type": "object",
+        "required": ["label"],
+        "properties": {
+          "label": {
+            "type": "string",
+            "minLength": 1
+          },
+          "month": {
+            "type": "string",
+            "pattern": "^\\d{4}-(0[1-9]|1[0-2])$"
+          },
+          "observedAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "Z$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "Edge": {
+        "type": "object",
+        "required": [
+          "id",
+          "sourcePageId",
+          "targetPageId",
+          "kind",
+          "directed",
+          "weight",
+          "evidence"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sourcePageId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "targetPageId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["clickstream", "wikidata"]
+          },
+          "directed": {
+            "type": "boolean"
+          },
+          "weight": {
+            "type": "number",
+            "minimum": 0
+          },
+          "evidence": {
+            "$ref": "#/components/schemas/Evidence"
+          }
+        },
+        "additionalProperties": false
+      },
+      "Cluster": {
+        "type": "object",
+        "required": [
+          "id",
+          "issueKey",
+          "label",
+          "summary",
+          "category",
+          "firstDetectedAt",
+          "hot",
+          "pulseScore",
+          "status",
+          "memberCount",
+          "nodes",
+          "edges"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "issueKey": {
+            "type": "string",
+            "nullable": true,
+            "description": "Legacy rows can omit the stable cross-snapshot identity. Do not infer continuity from a snapshot-local id."
+          },
+          "label": {
+            "type": "string",
+            "nullable": true
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "nullable": true
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "politics",
+              "world",
+              "society",
+              "economy",
+              "technology",
+              "science",
+              "culture",
+              "sports",
+              "environment",
+              "other"
+            ]
+          },
+          "firstDetectedAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "Z$",
+            "nullable": true
+          },
+          "hot": {
+            "type": "boolean"
+          },
+          "pulseScore": {
+            "type": "number",
+            "minimum": 0
+          },
+          "status": {
+            "type": "string",
+            "description": "이슈 판정 후 AI 보강 상태. DETECTED는 처리 전, VERIFYING은 처리 중, CONFIRMED는 요약 생성과 종목 검증 작업 종료를 뜻한다. 관련 종목이 0개인 CONFIRMED는 모든 작업이 끝났을 때만 가능하다. GMS·GDELT 실패와 재시도는 VERIFYING으로 남긴다.",
+            "enum": ["DETECTED", "VERIFYING", "CONFIRMED"]
+          },
+          "memberCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "nodes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Node"
+            }
+          },
+          "edges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Edge"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "MapMeta": {
+        "type": "object",
+        "required": [
+          "snapshotTs",
+          "source",
+          "scoreVersion",
+          "newWindowHours",
+          "clusterCount",
+          "nodeCount",
+          "edgeCount",
+          "truncated"
+        ],
+        "properties": {
+          "snapshotTs": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "Z$"
+          },
+          "source": {
+            "type": "string",
+            "enum": ["live", "replay"]
+          },
+          "dataMode": {
+            "type": "string",
+            "minLength": 1
+          },
+          "scoreVersion": {
+            "type": "string",
+            "minLength": 1
+          },
+          "newWindowHours": {
+            "type": "number",
+            "exclusiveMinimum": true,
+            "minimum": 0
+          },
+          "clusterCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "nodeCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "edgeCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "MapResponse": {
+        "type": "object",
+        "required": ["data", "meta"],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["clusters"],
+            "properties": {
+              "clusters": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Cluster"
+                }
+              }
+            },
+            "additionalProperties": false
+          },
+          "meta": {
+            "$ref": "#/components/schemas/MapMeta"
+          }
+        },
+        "additionalProperties": false
+      },
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["code"],
+            "properties": {
+              "code": {
+                "type": "string",
+                "minLength": 1
+              },
+              "message": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}

@@ -1,0 +1,295 @@
+# stock — 종목 마스터·설명·임베딩·주가 적재
+
+- `S15P21A609-33` 종목 마스터 (SEC + NASDAQ Trader → PostgreSQL)
+- `S15P21A609-34` 사업 설명 수집 + 임베딩 (yfinance → text-embedding-3-small → pgvector)
+- `S15P21A609-64` 주가 일봉 적재 + 일별 증분 갱신 (yfinance → stock_price)
+- `S15P21A609-204` 산업(sector) 수집 (yfinance info → stock.sector)
+
+명세: [docs/requirements-v0.3.md](../../docs/requirements-v0.3.md) §3.2 9번, §4, §5, §6
+
+```
+종목 마스터 ──▶ 사업 설명 ──▶ 임베딩
+ universe      summaries       embed
+ (SEC+NASDAQ)  (yfinance)      (GMS)
+      └──────▶ 주가 일봉
+               prices
+               (yfinance)
+```
+
+세 단계를 나눴다. 뒤 단계는 "앞 단계가 채운 것 중 아직 안 한 것"부터
+이어서 한다 — 수집이 잘 끊기고, 임베딩은 크레딧을 써서, 중간에 죽어도
+다시 호출하지 않게 DB 에 단계별로 저장한다.
+
+## 실행
+
+```bash
+export DATABASE_URL=postgresql://wikipulse:pw@localhost:5432/wikipulse
+export GMS_API_KEY=...            # .env 참고. 저장소에 넣지 않는다.
+
+python -m stock.universe          # 1. 마스터 (약 5,400종목)
+python -m stock.summaries         # 2. 사업 설명
+python -m stock.embed             # 3. 임베딩
+python -m stock.prices            # 4. 주가 일봉 (첫 실행 5년, 이후 증분)
+python -m stock.sectors           # 5. 산업 (sector 가 NULL 인 종목만)
+
+python -m stock.universe --dry-run   # 적재 없이 개수만
+```
+
+## 주가 (prices)
+
+한 코드 경로가 초기 적재와 일별 갱신을 둘 다 한다. 종목마다 `stock_price` 에
+마지막 `trade_date` 가 있으면 **그 날부터**(포함, upsert 로 정정도 반영), 없으면
+**5년 전체**를 받는다.
+
+```bash
+python -m stock.prices                       # 전 종목. 없으면 5년, 있으면 마지막 날부터
+python -m stock.prices --period 2y           # 기존 행 없는 종목의 초기 기간
+python -m stock.prices --tickers AAPL,MSFT   # 특정 종목만
+python -m stock.prices --throttle 0.5        # 야후에 차단당하면 간격을 올린다
+python -m stock.prices --limit 20 --dry-run  # DB 안 건드리고 20종목만 시험
+```
+
+- **첫 실행** = 전 종목 5년 초기 적재. **매일 cron** = 인자 없이 돌리면 마지막 날
+  이후만 받는 증분 갱신이다. **중간에 죽고 재실행** = 받은 종목은 마지막 날만,
+  못 받은 종목은 5년 — `summaries`·`embed` 와 같은 "이어서" 원리.
+- **재실행 안전**: `ON CONFLICT (ticker, trade_date) DO UPDATE` 라 중복 행이 안 생긴다.
+- **실패 격리**: 종목별 지수 백오프(2·4·8초, 최대 4시도) 후에도 실패하면 그 종목만
+  건너뛰고 나머지를 계속 적재한다. 끝에 `적재·데이터없음·실패` 개수를 보고한다.
+- **조용한 대량 실패 감지**: 하드 실패뿐인데 하나도 못 받았거나, 초기 적재 대상이
+  전부 0행이면 **종료코드 1** 로 끝나 cron 이 성공으로 오인하지 않는다. 초기 적재
+  (마지막 `trade_date` 없음)인데 0행이면 정상 "신규 없음"이 아니라 차단 의심이라
+  따로 세어(`초기적재 빈결과 N`) 경고한다.
+  - ⚠️ **주말·휴장일 증분 실행은 정상적으로 `ok==0`**(신규 거래일 없음)이라 종료코드
+    0 이다 — 이걸 실패로 보지 않는다. 증분(start 있음) 빈결과는 실패 판정·서킷
+    브레이커 어디에도 카운트하지 않는다.
+- **서킷 브레이커 (P2-F)**: 연속 25종목을 못 받으면(실패 또는 초기적재 0행) 야후
+  전면 차단으로 보고 조기 중단한다. 차단 상태에서 5,100종목을 각 ~14초씩 헛도는
+  것을 막는다. 하나라도 받으면 카운터가 리셋된다. `--throttle` 로 간격을 올려
+  재실행한다.
+- **`--tickers` 가드**: 마스터(`stock`)에 없는 심볼은 자동 제외한다. `stock_price`
+  가 `stock` 을 FK 참조해, 없는 심볼을 넣으면 저장이 통째로 막히기 때문이다.
+- 🔴 **raw(조정 안 함) OHLC 를 저장한다.** 조정가는 배당·분할마다 과거 전 구간이
+  다시 계산돼, 5년 초기분과 매일 증분분의 기준이 어긋난다. raw 는 날짜별 값이
+  안 변해 증분 append 와 정합하다. 분할일 차트 튐은 "참고 컨텍스트"라 허용한다.
+
+## EC2 운영 DB 적재 (주가) — S15P21A609-185
+
+`S15P21A609-147`(방지섭, 완료)이 종목 마스터·설명·임베딩을 EC2 운영 DB에 올렸을 때
+**주가는 "범위 밖 — 필요하면 별건"으로 남겼다.** 그 별건이 **S15P21A609-185**다.
+운영에서 라이브 매칭·요약은 정상이었는데(검증 종목 155건 / 61 issue_key) `stock_price`
+만 0행이라 화면에 "가격 미제공"이 떴다. 아래로 채웠다.
+
+**대상 = 검증 티커 17개** — 배포 DB `cluster_stock.verified`에 등장하는 전 티커로 한정한다.
+전 종목(5천여) 5년치가 아니라, 실제로 이슈에 매칭돼 화면에 뜰 종목만 넣는다.
+
+```
+ACM, AERO, ALK, BA, CAAP, CPA, DAL, DJT, FUBO, FUN, GRSD, MANU, MMYT, OKLO, OPBK, WH, YTRA
+```
+
+코드 변경은 없다 — `stock.prices`가 이미 `--tickers`를 지원한다(위 절 참고). 코드는 EC2
+호스트에 바인드 마운트돼 있고(`/home/ubuntu/wikipulse-local-test/data-pipeline → /opt/app`,
+이미지 `wikipulse-spark-standalone:local`, python 3.11), `stock.prices`는 `DATABASE_URL` +
+`yfinance`만 있으면 된다(yfinance는 이미지에 없어 런타임 설치). postgres는
+`postgres_default` 네트워크에 있다.
+
+```bash
+# 로컬(Windows Git Bash)에서 SSH로 EC2에 붙어 일회성 컨테이너 실행.
+# pem 경로는 각자 로컬 경로로 바꾼다(개인 환경 — 저장소에 실경로를 박지 않는다).
+# DB 비밀번호는 컨테이너 env에서 서버 안에서만 읽어 DATABASE_URL로 넘긴다 — 저장소·로그에 안 남긴다.
+ssh -i <로컬 pem 경로>/J15A609T.pem ubuntu@j15a609.p.ssafy.io '
+PGPW=$(sudo docker inspect postgres-postgres-1 --format "{{range .Config.Env}}{{println .}}{{end}}" | grep "^POSTGRES_PASSWORD=" | cut -d= -f2-)
+sudo docker run --rm --network postgres_default \
+  -v /home/ubuntu/wikipulse-local-test/data-pipeline:/opt/app -w /opt/app \
+  -e DATABASE_URL="postgresql://usera609:$PGPW@postgres-postgres-1:5432/wikipulse" \
+  wikipulse-spark-standalone:local \
+  sh -c "pip install -q yfinance \"psycopg[binary]\" && python -m stock.prices --tickers ACM,AERO,ALK,BA,CAAP,CPA,DAL,DJT,FUBO,FUN,GRSD,MANU,MMYT,OKLO,OPBK,WH,YTRA --throttle 0.3"
+'
+```
+
+- 결과(2026-09-22 실행): `stock_price` **0행 → 20,276행**(17종목 × 5년 일봉, 실패 0).
+- 기본 period가 5y라 2025-06 데모 구간까지 커버된다. API가 조회 시 `from`/`to`로 창을 자른다.
+- **검증**: `GET /api/v1/stocks/BA/prices?from=2025-06-01&to=2025-06-20`가 실제 OHLCV를 반환.
+  시연 이슈 Air India Flight 171(id 13267) → BA(보잉)의 사고일 2025-06-12 전후 가격이 있다.
+- **행 수 확인(읽기 전용)**: 위 SSH로 `sudo docker exec postgres-postgres-1 psql -U usera609 -d
+  wikipulse -c "SELECT count(*), count(DISTINCT ticker) FROM stock_price;"` → `20276 / 17`.
+- 🔴 **되돌리기**: 운영 DB에서 `TRUNCATE stock_price;` (이 테이블은 가격 전용, FK 참조 없음).
+- 🔴 재실행하려면 위를 그대로 다시 돌린다 — `ON CONFLICT` upsert라 중복 행은 안 생긴다.
+- ⚠️ 검증 티커는 이슈 매칭 결과에 따라 늘어난다. 새 종목이 매칭되면 위 `--tickers`에 추가해
+  다시 돌리거나, 전 종목 적재로 확장할지는 팀 결정이다(현재는 검증 티커 한정).
+
+## 산업 (sectors) — S15P21A609-204
+
+종목 탐색 목록·상세의 "산업" 칸이 `stock.sector` 다. V1 부터 컬럼은 있었지만 채우는
+코드가 없어 운영 DB 5,396종목이 전부 NULL 이었고 화면이 전부 "산업 미제공"이었다.
+
+```bash
+python -m stock.sectors                       # sector 가 NULL 인 전 종목
+python -m stock.sectors --tickers BA,DAL      # 그중 특정 종목만
+python -m stock.sectors --limit 20 --dry-run  # DB 안 건드리고 20종목만 시험
+```
+
+- **summaries 와 별도 모듈인 이유**: summaries 는 `business_summary IS NULL` 만 돈다.
+  운영 DB 는 설명이 이미 다 차 있어서 거기 끼우면 채울 종목이 대상에 안 들어온다.
+- **이어서**: `sector IS NULL` 인 종목만 돈다. 50종목마다 저장하고, 이미 채운 종목은
+  다시 안 부른다. `--tickers` 로 준 종목 중 이미 채워진 것·마스터에 없는 것은 따로 알린다.
+- **값**: `yf.Ticker(t).info["sector"]` 원문 그대로(예: `Industrials`). 없거나 빈 문자열이면
+  NULL 로 둔다 — 화면에 "산업 미제공"이 뜨는 게 정상이다. `industry` 는 컬럼이 없어 안 받는다.
+  - ⚠️ **어휘는 Yahoo(Morningstar) 11분류다. GICS 명칭이 아니다** — `Consumer Cyclical`·
+    `Healthcare`·`Financial Services`·`Communication Services` 등(GICS 는 Consumer Discretionary·
+    Health Care·Financials). 백엔드 `?sector=` 필터는 대소문자까지 **정확 일치**라 GICS 이름으로
+    치면 오류 없이 0건이다. 화면은 영문 원문을 그대로 보여 준다(FE 목 데이터의 한국어 라벨과 다르다).
+  - ⚠️ "없음" 종목은 NULL 로 남아 **재실행할 때마다 다시 부른다.** 전 종목을 돌리면 그만큼 헛호출이 생긴다.
+- **실패 격리**: 한 종목이 예외면 그 종목만 건너뛴다. 연속 25종목이 예외면 서킷 브레이커로
+  중단하고(받은 값은 저장), 브레이커가 걸렸거나 하나도 못 받았는데 실패가 있으면 종료코드 1.
+  - ⚠️ yfinance 1.7.0 은 없는 심볼에 예외 없이 sector 없는 dict 를 준다(2026-09-23 실측). 차단이
+    그런 형태로 오면 "없음"으로 세어지므로, 전부 "없음"이면 종료코드 0 이되 경고를 찍는다.
+- **백엔드·FE 변경 없음**: `StockRepository` 가 이미 `s.sector` 를 select 하고 FE 가
+  그대로 표시한다. DB 에 값만 들어가면 재배포 없이 바로 보인다.
+
+## EC2 운영 DB 적재 (산업) — S15P21A609-204
+
+대상은 주가와 같은 **검증 티커 17개**(위 주가 절 참고). 로컬 실측(2026-09-23)에서
+17개 모두 yfinance `info` 에 sector 가 있었다 — 운영 실행 결과는 아래 결과 줄에 따로 적는다.
+
+### 1) 서버에 코드 올리기 (develop 머지 후)
+
+🔴 **`git pull` 하지 않는다.** `/home/ubuntu/wikipulse-local-test` 는 git 체크아웃이 아니라
+tarball 복사본이고(`infra/live/README.md`), 운영 `live-cycle`·`live-cluster`·`edit-stream` 이
+같은 디렉터리를 읽는다. 지금까지처럼 **파일 단위로 백업 후 복사**하고 md5 로 확인한다
+(`docs/next-steps-2026-09-23.md` §5 와 같은 방식). 인프라 작업이라 담당자와 조율한다.
+
+올릴 파일은 셋이다. 운영 컨테이너는 `stock/` 을 임포트하지 않는다(일회성 컨테이너만 쓴다).
+
+| 파일 | 왜 |
+| --- | --- |
+| `stock/sectors.py` | 신규 |
+| `stock/db.py` | `tickers_missing_sector`·`save_sectors` 두 함수 추가뿐 |
+| `stock/prices.py` | 내용 변경 없음. `sectors.py` 가 `_yahoo_symbol`·`select_targets` 를 임포트한다 — 서버 사본이 `_yahoo_symbol` 이전 판이면 ImportError 라서 develop 판과 md5 를 맞춘다 |
+
+```bash
+# 로컬 저장소 루트에서. <로컬 pem 경로> 는 각자 바꾼다(개인 경로를 저장소에 박지 않는다).
+PEM=<로컬 pem 경로>/J15A609T.pem
+HOST=ubuntu@j15a609.p.ssafy.io
+DIR=/home/ubuntu/wikipulse-local-test/data-pipeline/stock
+TS=$(date -u +%Y%m%d-%H%M%S)
+
+# 서버 사본 백업 (sectors.py 는 신규라 없다)
+ssh -i "$PEM" "$HOST" "cd $DIR && for f in db.py prices.py; do cp -p \$f \$f.bak-204-$TS; done"
+# 복사 → md5 대조 (로컬 = 서버)
+scp -i "$PEM" data-pipeline/stock/sectors.py data-pipeline/stock/db.py data-pipeline/stock/prices.py "$HOST:$DIR/"
+md5sum data-pipeline/stock/{sectors,db,prices}.py
+ssh -i "$PEM" "$HOST" "cd $DIR && md5sum sectors.py db.py prices.py"
+```
+
+- 되돌리기(코드): `db.py`·`prices.py` 를 `*.bak-204-<TS>` 로 되돌리고 `sectors.py` 를 지운다.
+
+### 2) 적재
+
+일회성 컨테이너로 돈다. 비밀번호는 서버 안에서만 읽는다(주가 절과 같은 방식).
+yfinance 는 `requirements.txt` 와 같은 **1.7.0 으로 고정**한다 — 0.2.51 은 조용히 0행이었다.
+
+```bash
+ssh -i <로컬 pem 경로>/J15A609T.pem ubuntu@j15a609.p.ssafy.io '
+PGPW=$(sudo docker inspect postgres-postgres-1 --format "{{range .Config.Env}}{{println .}}{{end}}" | grep "^POSTGRES_PASSWORD=" | cut -d= -f2-)
+sudo docker run --rm --network postgres_default \
+  -v /home/ubuntu/wikipulse-local-test/data-pipeline:/opt/app -w /opt/app \
+  -e DATABASE_URL="postgresql://usera609:$PGPW@postgres-postgres-1:5432/wikipulse" \
+  wikipulse-spark-standalone:local \
+  sh -c "pip install -q yfinance==1.7.0 \"psycopg[binary]==3.3.5\" && python -m stock.sectors --tickers ACM,AERO,ALK,BA,CAAP,CPA,DAL,DJT,FUBO,FUN,GRSD,MANU,MMYT,OKLO,OPBK,WH,YTRA"
+'
+```
+
+### 3) 확인
+
+- **커버리지(읽기 전용)** — SQL 에 작은따옴표가 있어 ssh 인자는 큰따옴표로 감싼다:
+
+```bash
+ssh -i <로컬 pem 경로>/J15A609T.pem ubuntu@j15a609.p.ssafy.io \
+  "sudo docker exec postgres-postgres-1 psql -U usera609 -d wikipulse -c \"SELECT count(*) FILTER (WHERE sector IS NOT NULL) AS filled, count(*) FROM stock WHERE ticker IN ('ACM','AERO','ALK','BA','CAAP','CPA','DAL','DJT','FUBO','FUN','GRSD','MANU','MMYT','OKLO','OPBK','WH','YTRA');\""
+```
+
+- **화면**: `GET https://j15a609.p.ssafy.io/api/v1/stocks?hasIssues=true` 의 `sector` 가 값으로
+  온다 → 종목 탐색에서 "산업 미제공" 대신 산업명(브라우저 하드 리프레시). 백엔드 재배포는 필요 없다.
+- 결과: (운영 실행 후 기록)
+
+### 되돌리기 (데이터)
+
+🔴 이 스크립트가 쓰는 건 `sector`·`updated_at` 뿐이다(`updated_at` 은 되돌리지 않아도 된다).
+
+```sql
+UPDATE stock SET sector = NULL WHERE ticker IN ('ACM','AERO','ALK','BA','CAAP','CPA','DAL','DJT','FUBO','FUN','GRSD','MANU','MMYT','OKLO','OPBK','WH','YTRA');
+```
+
+재실행은 안전하다 — 이미 채워진 종목은 건너뛴다.
+
+## 규모 (2026-09-08 실측)
+
+```
+보통주 5389종목
+  거래소: NASDAQ 3141 · NYSE 1989 · NYSE American 259
+  SEC CIK 매칭: 5339 (99%)
+```
+
+명세의 "약 5,100"과 맞는다. ETF·우선주·워런트·유닛을 빼고 보통주만 남긴 값이다.
+
+## 왜 이렇게 소스를 골랐나
+
+**티커는 NASDAQ Trader 가 정답이다.** Wikidata `wdt:P249` 로 조회하면 40건만
+나온다 — 티커가 P414 문의 한정어라 조용히 0에 수렴한다 (CLAUDE.md 폐기 절).
+NASDAQ Trader `nasdaqlisted.txt` + `otherlisted.txt` 가 거래소별 상장 목록을
+그대로 준다.
+
+**CIK·정식 회사명은 SEC 로 보강한다.** 거래소 파일의 이름은 "- Common Stock"
+같은 접미가 붙어 지저분하다. SEC `company_tickers.json` 의 title 로 덮는다.
+SEC 에 없으면 거래소 이름을 그대로 둔다.
+
+**보통주만 남긴다.** 우선주·ADR·워런트는 사업 설명이 보통주와 겹쳐 매칭
+노이즈만 늘린다. Test Issue·ETF 플래그로 거르고, Security Name 이
+"Common Stock" / "Ordinary Shares" 인 것만 통과시킨다.
+
+## 검증
+
+```bash
+python -m pytest                 # 파싱·필터·주가변환·대상선택, 네트워크 없이 21개
+```
+
+마스터·설명·임베딩 end-to-end 는 진짜 PostgreSQL 로 확인했다 (2026-09-08). 마스터
+5,389종목 적재 → 표본 12종목 설명 수집 → GMS 임베딩(1536차원) → pgvector Top-K.
+XOM(엑손모빌) 코사인 Top-5 에 CVX(셰브론) 0.62, FRO(유조선) 등 에너지가 뭉쳤다.
+
+주가 fetch 는 라이브 Yahoo 로 확인했다 (2026-09-10). AAPL 초기 period·MSFT 증분
+start·없는 티커 graceful 세 경로 모두 정상, raw OHLCV·정수 volume·거래일 날짜 확인.
+`run()`·upsert 는 pgserver 실 PostgreSQL e2e 로 확인했다 (2026-09-11): 마지막 종목
+실패 시 잔여 버퍼 저장, 전량 빈결과 시 종료코드 1, dry-run 무저장, `--tickers`
+미존재 심볼 제외 — 4경로 모두 통과.
+
+**전수 백필 실측 (2026-09-11, 로컬 dev PostgreSQL)**: 마스터 5,391종목 →
+`stock_price` **5,369종목 · 5,754,172행** (2021-09-13 ~ 2026-09-10, 5년). 미적재 22개는
+전부 워런트(`.W`)·유닛(`.U`)로 Yahoo 에 데이터가 없다 — 워런트/유닛 아닌 실 종목은
+100% 적재. 주요 종목 1,254행 풀 확인(AAPL·MSFT·NVDA·BRK.A 809,350 등).
+
+## 함정
+
+- **GMS 크레딧.** 502건 임베딩에 100 남짓 썼다 (2026-09-07). 만료 2026-10-02.
+- **임베딩 차원.** `text-embedding-3-small` 은 1536. `db` 스키마의 `vector(1536)`
+  과 맞아야 한다. `embed.py` 가 응답 차원을 검사해서 다르면 멈춘다.
+- **yfinance 결측.** 표본 200종목 보유율 100% 였지만 전체에서 일부는 설명이
+  없을 수 있다. `summaries.py` 가 없는 것을 세어 보고한다.
+- **⚠️ yfinance 버전.** `0.2.51` 은 `.history()` 가 현재 Yahoo 에서 깨져 전 종목
+  0행이 **조용히** 나온다 (크럼 단계 "Expecting value"). `1.7.0` 으로 올렸다
+  (2026-09-10). 다시 내리면 주가가 안 쌓이는데 에러가 안 나 늦게 발견된다.
+- **⚠️ Yahoo 글리치 값.** 일부 종목(리버스 스플릿 이력 등)은 Yahoo 가 말도 안 되는
+  가격을 뱉는다. WHLR 은 최대 ~1,475억까지 나왔다 (2026-09-11 전수 실측). `_price`
+  가 NUMERIC(14,4) 범위(10^10 미만) 밖은 버려 **크래시는 막지만**, 10^10 미만의
+  억대 글리치(WHLR 67.9억 등)는 통과해 그대로 저장된다. 정밀 이상치 제거(중앙값·MAD
+  기준)는 별도 과제다 — 지금은 "참고 컨텍스트" 차트라 허용한다.
+- **클래스주 티커.** 마스터는 `BRK.A`(NASDAQ Trader 형식)인데 Yahoo 는 `BRK-A`.
+  `_yahoo_symbol` 이 `.`→`-` 변환한다. 안 하면 클래스주가 조용히 0행이 된다.
+- **SEC 이름이 최신이다.** XOM 이 `ExxonMobil Holdings Corp` 로 나오는데
+  (CIK 2115436) 이건 SEC 원본 그대로다 — 오류가 아니다.
+
+## 미확정
+
+- **적재 스케줄.** 지금은 수동이다. 마스터는 자주 안 바뀌니 주 1회 cron,
+  주가(`prices`)는 장 마감 후 일 1회 cron 이면 된다 — 스크립트 자체가 증분이라
+  인자 없이 반복하면 된다. 상장·폐지 반영 주기와 cron 배치 위치는 팀 결정 사항이다.

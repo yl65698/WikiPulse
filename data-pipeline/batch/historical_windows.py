@@ -1,0 +1,223 @@
+"""문서별 Historical Window 집계 — baseline 입력 데이터셋 (S15P21A609-58).
+
+편집 덤프 적재본(S15P21A609-56)과 조회수 적재본(S15P21A609-57)을 읽어, baseline
+(spike/baseline.py build_baseline)이 읽을 **문서 × 시간 윈도우** 데이터셋을 만든다.
+지금 이 형태를 만드는 코드가 없어 baseline 배치가 통째로 no-op 이다.
+
+산출 형태 (한 행)
+    (wiki, title, window_start, hour_of_day, edit_count, editor_count, views)
+      window_start : 1시간 정각 UTC "YYYY-MM-DDTHH:00:00"
+      hour_of_day  : 0..23 (UTC 시). baseline 이 이 슬롯으로 평소를 잡는다
+      edit_count   : 그 문서·그 시간의 봇 제외 편집 수
+      editor_count : 그 윈도우의 서로 다른 편집자 수. 급증 판정의 편집자 하한
+                     (detector.MIN_DISTINCT_EDITORS, S15P21A609-85)이 이 값을 본다.
+                     🔴 스트리밍은 approx_count_distinct(근사), 여기는 정확값이라
+                     **두 값이 갈린다.** ~~편집자 1~10명 구간에서 일치함을 실측(불일치 0건)~~
+                     → 표본을 200,000 events 로 키우니 **21건 불일치**(전부 과소 계수,
+                     2→1 이 13건)였고 그 13건이 편집자 하한을 뒤집었다
+                     (2026-09-15, S15P21A609-83). 작은 표본에서는 HLL 희소 표현이
+                     정확해 안 드러난다. → rsd=0.01 로 확정해 불일치 0건이 됐다
+                     (2026-09-15, S15P21A609-89). streaming.EDITOR_COUNT_RSD 주석 참고.
+      views        : 그 문서·그 시간의 조회수 합(agent 가로질러). 조회 없으면 0
+
+🔴 집계 계약은 스트리밍(streaming/edit_windows.py)과 한 벌이어야 한다 (§AC)
+    - **윈도우 길이 = 1시간.** 스트리밍 WINDOW_SIZE 와 일치시킨다. 다르면 edit_z 가
+      통째로 어긋나는데 에러 없이 숫자만 틀린다. baseline 은 24 슬롯(hour_of_day)이라
+      1시간이 자연스러운 정합값이다.
+    - **봇 필터 = is_bot 참인 편집 제외.** 스트리밍의 `~coalesce(is_bot, False)` 와 같다.
+    - **문서 키 = (wiki, title), title 은 canonical 공백형.** -56·-57 과 같다.
+      dump page_id 는 쓰지 않는다 — wiki_page.id 해석은 적재(S15P21A609-60) 책임.
+
+🔴 제목은 **읽는 지점에서** canonical 로 맞춘다 (S15P21A609-92)
+    ~~샤드 title 을 그대로 키로 썼다~~ → 샤드 세대가 둘이라 그러면 안 된다.
+    S15P21A609-79 부터 normalize_dump·pageview 가 공백형을 내지만, 그 전에 만든 -56
+    편집 샤드는 밑줄형이다. 세대가 섞이면 join_windows 의 (wiki, title, hour) 가
+    **한 건도 안 맞아** 같은 문서·같은 시각이 views=0 행과 edit_count=0 행 둘로 쪼개진다.
+    view_ewma 가 전부 비고, 조회수 단독 발동(S15P21A609-90)이 통째로 죽는다 —
+    **에러는 안 나고 행 수만 는다.**
+    canonical_title 은 멱등이라 신세대 샤드에는 아무 영향이 없다.
+    db/README.md 가 정한 규칙 그대로다: 집계가 끝난 뒤가 아니라 읽는 지점에서 맞춘다.
+
+왜 순수 파이썬인가 (Spark 아님)
+    HDFS 2노드(S15P21A609-28)·Spark 2노드(S15P21A609-27)가 아직 없다. 형제 적재
+    (-56·-57)와 같이 순수 파이썬으로 두어 인프라 없이 파싱·집계·테스트가 돌게 한다.
+    parquet 출력과 "배치==스트리밍" 대조는 인프라가 서면 잇는다(아래 CLI·README).
+    hour_of_day 정의는 spike/baseline.py 의 Spark 판과 반드시 같아야 한다(UTC 시).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
+from datetime import datetime
+from typing import NamedTuple
+
+from producer.normalize import canonical_title
+
+#: 집계 윈도우(시간). 스트리밍 WINDOW_SIZE 와 맞춘다. baseline 24 슬롯의 입도.
+WINDOW_HOURS = 1
+
+
+@dataclass(frozen=True)
+class WindowRow:
+    """문서 × 1시간 윈도우. baseline build_baseline 의 입력 한 행."""
+    wiki: str
+    title: str
+    window_start: str    # "YYYY-MM-DDTHH:00:00" (UTC)
+    hour_of_day: int      # 0..23 (UTC 시)
+    edit_count: int
+    editor_count: int
+    #: 🔴 **조회수 원본이 없으면 None 이다. 0 이 아니다** (2026-09-18, S15P21A609-127).
+    #: ~~없으면 0~~ 은 두 곳에서 조용히 틀렸다:
+    #:   1. `build_rows` 가 0 을 **관측값으로** 세어 view_ewma 를 끌어내린다. 조회수를
+    #:      아직 안 받은 시간이 "그 시간엔 아무도 안 봤다" 가 되어 기준선이 낮아지고,
+    #:      그만큼 없는 급증이 생긴다.
+    #:   2. 2단계 계약에서 0 은 REJECTED(다시 안 봄)이고 None 은 후보 대기(재판정)다.
+    #:      `PageWindow.from_row` 가 경계에서 0 을 None 으로 되돌리고 있었는데
+    #:      (S15P21A609-126), 그 임시 보정의 근본 해결이 여기다.
+    #: ⚠️ "진짜 그 시간에 0회 조회" 와 "원본 미도착" 은 여전히 다른 값이다 — 전자는 0.
+    views: int | None
+    #: 시점 감사 증거 (V9, S15P21A609-129 2번). 판정에는 안 쓴다.
+    #: 조회수만 있고 편집이 없는 윈도우는 revision 이 없어 None 이다.
+    max_rev_id: int | None = None
+    last_edit_ts: str | None = None
+
+
+class EditAggregate(NamedTuple):
+    """한 (wiki, title, hour) 의 편집 집계.
+
+    ~~(편집 수, 편집자 수) 튜플~~ → 이름 붙인 네 값 (2026-09-18, S15P21A609-129 2번).
+    시점 증거 두 개가 붙으면서 위치 튜플로는 어느 자리가 무엇인지 알 수 없어졌다.
+    앞 두 자리는 그대로라 `agg[:2]` 는 여전히 옛 튜플과 같다.
+    """
+    edit_count: int
+    editor_count: int
+    max_rev_id: int | None
+    last_edit_ts: str | None
+
+
+def _parse_iso(ts: str) -> datetime:
+    """ISO 타임스탬프를 datetime 으로. 'Z'·마이크로초·초 정밀도 모두 받는다."""
+    return datetime.fromisoformat(ts.replace("Z", "+00:00").replace(" ", "T"))
+
+
+def floor_to_hour(ts: str) -> str:
+    """타임스탬프를 그 시각의 정각으로 내린다 → "YYYY-MM-DDTHH:00:00"."""
+    dt = _parse_iso(ts)
+    return f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}T{dt.hour:02d}:00:00"
+
+
+def hour_of_day(hour_ts: str) -> int:
+    """정각 타임스탬프 → 0..23 (UTC 시).
+
+    🔴 spike/baseline.py 의 Spark 판과 같은 정의여야 한다.
+
+    ~~요일×시간(0..167)~~ → 시간(0..23) (2026-09-15, S15P21A609-84). 주 1회 오는 슬롯은
+    28일 창에서 관측이 최대 4개뿐이라 sample_days 가 MIN_BASELINE_SAMPLE_DAYS(7) 에
+    구조적으로 도달하지 못했다 — 기존 문서도 항상 is_thin 이라 z 경로가 죽어 있었다.
+    대신 "요일을 크게 탄다"는 168 슬롯의 근거는 포기한다(명세 §11 실측에서 이득이 더 컸다).
+    """
+    return _parse_iso(hour_ts).hour
+
+
+def is_bot_edit(rec: dict) -> bool:
+    """봇 편집이면 True. 스트리밍의 ~coalesce(is_bot, False) 와 같은 판정."""
+    return bool(rec.get("is_bot"))
+
+
+def aggregate_edits(
+    edit_events: Iterable[dict], *, keep_bots: bool = False
+) -> dict[tuple[str, str, str], EditAggregate]:
+    """edit_event 레코드를 (wiki, title, hour) → (편집 수, 편집자 수) 로 집계한다.
+
+    봇은 기본 제외(keep_bots=True 면 유지 — 진단용). 시간은 event_ts 를 정각으로 내린다.
+    편집자 수를 함께 세는 이유는 한 사람의 연속 편집을 급증에서 빼기 위해서다
+    (S15P21A609-85) — 스트리밍이 이미 같은 값을 집계하므로 배치도 낸다.
+    """
+    counts: dict[tuple[str, str, str], int] = {}
+    editors: dict[tuple[str, str, str], set[str]] = {}
+    max_rev: dict[tuple[str, str, str], int] = {}
+    last_ts: dict[tuple[str, str, str], str] = {}
+    for rec in edit_events:
+        if not keep_bots and is_bot_edit(rec):
+            continue
+        key = (rec["wiki"], canonical_title(rec["title"]),
+               floor_to_hour(rec["event_ts"]))
+        counts[key] = counts.get(key, 0) + 1
+        user = rec.get("user")
+        if user:
+            editors.setdefault(key, set()).add(user)
+        # 시점 증거 (V9). 스트리밍의 max(rev_id)·max(event_ts) 와 같은 집계다 —
+        # 갈리면 두 경로가 서로 다른 증거를 남긴다(`tests/test_stream_batch_parity.py`).
+        rev_id = rec.get("rev_id")
+        if rev_id is not None:
+            max_rev[key] = max(max_rev.get(key, 0), int(rev_id))
+        event_ts = rec.get("event_ts")
+        if event_ts is not None and event_ts > last_ts.get(key, ""):
+            last_ts[key] = event_ts
+    return {
+        k: EditAggregate(n, len(editors.get(k, ())), max_rev.get(k), last_ts.get(k))
+        for k, n in counts.items()
+    }
+
+
+def sum_views(
+    pageviews: Iterable[dict], *, agents: set[str] | None = None
+) -> dict[tuple[str, str, str], int]:
+    """pageview 레코드를 (wiki, title, ts_hour) → 조회수 합 으로 집계한다.
+
+    agents 를 주면 그 agent 만 합산한다(None 이면 전부). 적재는 agent 를 분리 저장하므로
+    (S15P21A609-57) 어떤 조합을 baseline 에 쓸지는 여기·-60 에서 정한다.
+    """
+    totals: dict[tuple[str, str, str], int] = {}
+    for rec in pageviews:
+        if agents is not None and rec["agent"] not in agents:
+            continue
+        key = (rec["wiki"], canonical_title(rec["title"]), rec["ts_hour"])
+        totals[key] = totals.get(key, 0) + int(rec["views"])
+    return totals
+
+
+def join_windows(
+    edit_counts: dict[tuple[str, str, str], EditAggregate],
+    view_totals: dict[tuple[str, str, str], int],
+) -> Iterator[WindowRow]:
+    """편집·조회 집계를 (wiki, title, hour) 기준 full outer join 한다.
+
+    baseline 은 edit_z(편집)와 view_ewma(조회수)를 둘 다 잡으므로, 한쪽만 있는 윈도우도
+    남긴다. 편집만 있는 시간·조회만 있는 시간이 모두 baseline 슬롯에 든다.
+
+    🔴 **없는 쪽의 값이 다르다.** 편집이 없으면 0 건이 맞다 — 편집 덤프는 그 시간 전체를
+    담고 있어서 "안 나옴 = 0건" 이다. 조회수는 아니다: 그 시간 파일을 아직 못 받았을 수도,
+    이 문서가 후보 필터 밖일 수도 있다. 그래서 조회수만 None 으로 둔다 (S15P21A609-127).
+    """
+    empty = EditAggregate(0, 0, None, None)
+    for key in edit_counts.keys() | view_totals.keys():
+        wiki, title, window_start = key
+        agg = edit_counts.get(key, empty)
+        yield WindowRow(
+            wiki=wiki,
+            title=title,
+            window_start=window_start,
+            hour_of_day=hour_of_day(window_start),
+            edit_count=agg.edit_count,
+            editor_count=agg.editor_count,
+            views=view_totals.get(key),
+            max_rev_id=agg.max_rev_id,
+            last_edit_ts=agg.last_edit_ts,
+        )
+
+
+def build_windows(
+    edit_events: Iterable[dict],
+    pageviews: Iterable[dict],
+    *,
+    agents: set[str] | None = None,
+    keep_bots: bool = False,
+) -> list[WindowRow]:
+    """edit_event·pageview 레코드에서 baseline 입력 행을 만든다. window_start 오름차순."""
+    edits = aggregate_edits(edit_events, keep_bots=keep_bots)
+    views = sum_views(pageviews, agents=agents)
+    rows = list(join_windows(edits, views))
+    rows.sort(key=lambda r: (r.wiki, r.title, r.window_start))
+    return rows

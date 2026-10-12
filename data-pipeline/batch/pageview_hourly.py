@@ -1,0 +1,299 @@
+"""`other/pageviews` **시간별** 덤프 파싱·필터 (S15P21A609-127).
+
+순수 함수라 네트워크·Spark·DB 없이 테스트된다. 적재 CLI 는 `pageview_hourly_ingest.py`.
+
+🔴 **이 소스가 2단계 최종 관문이다** (명세 §3.2 3번). `batch/pageview.py` 의
+`pageview_complete` **일별** 덤프는 하루가 끝나야 나와서 LIVE 판정에 못 쓴다 — 그건
+품질 검증용으로 함께 보존하는 소스다. AQS 일별 API 도 LIVE 관문이 아니다.
+
+🔴 **파일명의 시각은 윈도우 끝이다. 시작이 아니다.** `pageviews-20250612-090000.gz` 는
+09시가 아니라 **08:00~09:00** 을 담는다 (2026-09-18 실측, 아래 근거). 이걸 시작으로 읽으면
+모든 조회수가 한 시간 늦게 붙는데, 값이 그럴듯해서 화면만 봐서는 모른다.
+
+    근거 — `Air India Flight 171` (2025-06-12, 문서 생성 08:58:02 UTC, 사고 08:09 UTC)
+      일별 pageview_complete 의 시간 프로파일:  08시 3회 · 09시 24,669회 · 10시 36,434회
+      시간별 `-090000` = 3       -> 일별 08시(생성 후 2분치)와 **정확히 같다**
+      시간별 `-100000` = 24,669  -> 일별 09시와 정확히 같다
+      시간별 `-110000` = 36,434  -> 일별 10시와 정확히 같다
+    2026-09-21 재현 — `ai/spec-evidence/pageview_hourly_offset.py align` (3구간 차이 0).
+    Main Page·Vijay Rupani 로도 같은 방향을 확인했다(한 시간 밀면 전부 어긋난다).
+
+    ⚠️ 위 대조에서 agent 없는 이 덤프와 일별 `agent=user` 값이 **비트 단위로 같았다.**
+       문서 1개·3구간 표본이라 "차이가 없다"로 일반화하지 않는다 — 아래 agent 절 참고.
+
+덤프 형식 (2026-09-18 실측, dumps.wikimedia.org/other/pageviews)
+    경로 : /{YYYY}/{YYYY}-{MM}/pageviews-{YYYYMMDD}-{HH}0000.gz   (HH = 윈도우 **끝**)
+    컬럼 : project title count bytes   (공백 4개, 헤더 없음)
+      project : 도메인 약어. `en`=en.wikipedia 데스크톱, `en.m`=모바일웹.
+                ⚠️ 일별 덤프의 `en.wikipedia` 와 **코드 체계가 다르다.**
+      title   : 문서 제목(공백은 밑줄). `-` 는 제목 없음(제외)
+                ⚠️ **percent-encoding 을 풀지 않는다.** `%` 가 든 제목은 한 시간 파일에
+                85행(조회수 264, 전체의 0.00%)뿐이고 전부 `1%_rule`·`%s` 처럼 **문자 그대로의
+                퍼센트**였다(2026-09-18 실측). 디코드하면 그런 제목이 오히려 깨진다.
+      count   : 그 시간의 조회수
+      bytes   : 응답 바이트 합. 요즘은 전부 0 이라 안 쓴다
+
+    2026-09-18 04:00Z 파일 실측: 45.7 MB(gz) · 5,144,442 행 · 압축 해제 1.0s.
+    `en`+`en.m` 은 2,025,414 행 · 조회수 8,140,767, 그중 ns0 은 1,915,570 행 · 7,923,840 회.
+
+지연 (실측. ⚠️ 윈도우 끝 기준이다)
+    2026-09-18 08:49Z 기준
+      [01:00~02:00) 공개 04:12Z (+132분) · [02:00~03:00) 05:05Z (+125분)
+      [03:00~04:00) 06:06Z (+126분) · [04:00~05:00) 07:13Z (+134분)
+      [05:00~06:00) 이후는 아직 404.
+    2026-09-21 00:36Z 재측정 (`ai/spec-evidence/pageview_hourly_offset.py delay`)
+      +127 · +152 · +138 · +150 · +153분 (09-20 16시~21시 구간), 그 뒤 3구간은 404.
+    합치면 **125~153분**이다. 한 시점의 표본으로 상한을 확정하지 않는다 — 09-18 만
+    보면 134분이 상한 같았는데 사흘 뒤 153분이 나왔다.
+
+    🔴 **약 2시간이다.** ~~명세 §3.2 3번의 "약 1시간 지연"~~ 은 이 실측으로 정정됐다
+       (2026-09-21 — §3.2·§11·기술 명세 §4 모두 약 2시간).
+    처음엔 1시간으로 쟀는데 그건 파일명을 윈도우 시작으로 잘못 읽었기 때문이다(위 🔴).
+    사건 발생부터 최종 노출까지의 목표도 1~2시간에서 **2~3시간**으로 옮겼다 — 원본이
+    없는 시점을 목표로 두면 내부 처리를 0으로 만들어도 못 지킨다.
+
+⚠️ **agent 필드가 없다.** 위키미디어가 감지한 봇·스파이더는 upstream 에서 이미
+   걸러 내지만(명세 §3.2 3번), 어느 agent 였는지는 노출하지 않는다. 그래서
+   `PageviewHourly` 에 agent 가 없다 — 일별 덤프의 `agent=user` 와 값이 다를 수 있고,
+   그 차이를 재는 것이 `pageview_complete` 를 계속 보존하는 이유다.
+
+제목 정규화 (S15P21A609-79)
+    `canonical_title` 로 공백형에 맞춘다. ⚠️ **적용 시점이 ns0 필터 뒤, 합산 키 앞**이다 —
+    `batch/pageview.py` 와 같은 이유이고, 순서가 뒤집히면 둘 다 조용히 틀린다.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+
+from producer.normalize import canonical_title
+
+from .pageview import NO_TITLE, SchemaMismatch, UnsupportedWiki, is_content_title
+
+#: 공백 구분 컬럼 수. 다르면 덤프 형식이 바뀐 것이다.
+HOURLY_COLUMNS = 4
+
+#: wiki DB 이름 → 이 덤프의 project 코드들. 데스크톱과 모바일이 **다른 행**으로 오므로
+#: 둘 다 받아 합친다 — 일별 덤프에서 access_method 를 가로질러 합치는 것과 같은 규칙이다.
+#: 🔴 `en.d`(wiktionary)·`en.b`(wikibooks) 등 자매 프로젝트를 넣지 않는다. 같은 `en` 으로
+#:    시작하지만 다른 위키다 — 넣으면 조회수가 부풀고 에러는 안 난다.
+#:    2026-09-18 한 시간 파일에 en 계열 16종이 있었다(en.d 92,769행 등).
+WIKI_TO_PROJECTS = {
+    "enwiki": frozenset({"en", "en.m"}),
+}
+
+#: 파일명에서 시각을 뽑는다: pageviews-20260918-040000.gz
+_FILENAME_TS = re.compile(r"pageviews-(\d{8})-(\d{2})0000")
+
+#: 파일명 시각과 윈도우 시작의 차이. 파일명은 윈도우 **끝**이다 (모듈 독스트링 🔴).
+FILENAME_IS_WINDOW_END = True
+
+
+@dataclass(frozen=True)
+class PageviewHourly:
+    """한 문서·한 시간의 조회수. ingest 가 JSONL.gz 로 쓰고 DB 는 `page_view_hourly` 로 받는다.
+
+    ⚠️ agent 가 없다 — 이 덤프가 안 준다(모듈 독스트링). `batch/pageview.py` 의
+    `PageviewRecord` 와 일부러 다른 타입인 이유다. 한 타입으로 합치면 agent 를
+    지어내야 한다.
+    """
+    wiki: str
+    title: str      # canonical 공백형. 덤프 원형(밑줄)이 아니다 — S15P21A609-79
+    ts_hour: str    # ISO "YYYY-MM-DDTHH:00:00" (UTC)
+    views: int
+    #: 그중 모바일(`en.m`). 🔴 **합산에 포함된 부분집합이다** — `views` 에서 빼지 않는다.
+    #: ~~데스크톱·모바일을 합치고 버렸다~~ → 보존 (2026-09-22, S15P21A609-210).
+    #: 봇 트래픽이 데스크톱 단일 채널로 오기 때문이다. `Roblox` 2026-08-10 은 하루
+    #: 478만 조회(674배)인데 모바일이 0.1% 였다(평소 60%). 반대로 진짜 사건은
+    #: 52~64% 다 — 골든데이 `Air India Flight 171` 63.1%. 겹치는 구간이 없다.
+    #: 근거: `ai/spec-evidence/gate-review/RESULT.md`.
+    mobile_views: int = 0
+
+    @property
+    def mobile_ratio(self) -> float | None:
+        """모바일 비중 0.0~1.0. `views` 가 0 이면 None — 0 으로 두면 봇으로 오해된다."""
+        return self.mobile_views / self.views if self.views else None
+
+
+def projects_for(wiki: str) -> frozenset[str]:
+    """wiki DB 이름 → 이 덤프의 project 코드 집합. 미등록이면 UnsupportedWiki."""
+    try:
+        return WIKI_TO_PROJECTS[wiki]
+    except KeyError:
+        raise UnsupportedWiki(
+            f"{wiki!r} project 코드 미등록. WIKI_TO_PROJECTS 에 추가한다. "
+            "⚠️ 일별 덤프의 WIKI_TO_PROJECT 와 코드 체계가 다르다."
+        ) from None
+
+
+def ts_hour_from_filename(name: str) -> str:
+    """`pageviews-20260918-040000.gz` → **`2026-09-18T03:00:00`** (윈도우 시작).
+
+    🔴 파일명 시각은 윈도우 **끝**이라 한 시간을 뺀다 (모듈 독스트링 🔴의 근거).
+       ~~파일명 시각을 그대로 썼다~~ → 그러면 모든 조회수가 한 시간 늦게 붙는다.
+    🔴 시각은 **파일명에서만** 온다. 행에는 시각 컬럼이 아예 없다 — 그래서 파일과
+       시각을 잘못 짝지으면 조회수 전체가 통째로 밀리고 아무 에러도 안 난다.
+
+    ⚠️ `-000000` 파일은 **전날 23시**다. 날짜가 넘어간다.
+    """
+    match = _FILENAME_TS.search(name)
+    if match is None:
+        raise SchemaMismatch(f"파일명에서 시각을 못 읽었다: {name!r}")
+    date, hour = match.groups()
+    end = datetime(int(date[:4]), int(date[4:6]), int(date[6:]), int(hour), tzinfo=timezone.utc)
+    start = end - timedelta(hours=1)
+    return start.strftime("%Y-%m-%dT%H:00:00")
+
+
+def filename_hour(ts_hour: str) -> tuple[str, str]:
+    """윈도우 시작 `2026-09-18T03:00:00` → 파일 날짜·시각 `("20260918", "04")`.
+
+    `ts_hour_from_filename` 의 역이다. 둘을 한 파일에 두는 이유는 한쪽만 고치면
+    조용히 어긋나기 때문이다.
+    """
+    start = datetime.strptime(ts_hour[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    return end.strftime("%Y%m%d"), end.strftime("%H")
+
+
+def parse_row(line: str, projects: frozenset[str]) -> tuple[str, int, bool] | None:
+    """공백 4컬럼 한 줄 → (canonical title, views, is_mobile). 대상 project·ns0 가 아니면 None.
+
+    컬럼 수가 4가 아니거나 조회수가 정수가 아니면 SchemaMismatch.
+
+    ⚠️ 제목에 공백이 들어간 행은 없다 — 이 덤프는 제목의 공백을 밑줄로 쓴다. 그래도
+    컬럼 수를 세는 이유는 형식이 바뀌면 **조용히 다른 값을 읽기** 때문이다.
+    """
+    fields = line.rstrip("\n").split(" ")
+    if len(fields) != HOURLY_COLUMNS:
+        raise SchemaMismatch(f"{len(fields)} columns, expected {HOURLY_COLUMNS}")
+    project, title, count_raw, _bytes = fields
+    if project not in projects:
+        return None
+    if title == NO_TITLE or not is_content_title(title):
+        return None
+    try:
+        views = int(count_raw)
+    except ValueError:
+        raise SchemaMismatch(f"{title!r} 조회수가 정수가 아니다: {count_raw!r}") from None
+    # ns0 판정이 끝난 뒤, 합산 키가 되기 전에 canonical 로 맞춘다 (S15P21A609-79).
+    canonical = canonical_title(title)
+    if not canonical:
+        # `_` · `__` 같은 행이 실제로 있다(2026-09-18 04:00Z 파일에 5회). canonical 을
+        # 거치면 빈 문자열이 되는데, 그대로 두면 제목이 빈 wiki_page 행이 생긴다.
+        return None
+    # ⚠️ 모바일 판정은 project 코드 **접미사**로 한다 (`en.m`·`de.m`…). `en` 에 붙는
+    #    다른 변종(`en.zero` 등)이 생겨도 데스크톱으로 오분류되지 않게 `.m` 만 본다.
+    return canonical, views, project.endswith(".m")
+
+
+def safe_row_floor(wiki: str, min_views: int) -> int:
+    """`min_views` 를 넘을 수 있는 문서라면 **행 하나는 반드시 이 값 이상**이다.
+
+    한 문서는 project 수만큼의 행으로 나뉘어 온다(enwiki 는 `en`·`en.m` 둘). 합이
+    `min_views` 이상이면 비둘기집 원리로 그중 하나는 `ceil(min_views / project 수)`
+    이상이다. 그래서 그보다 작은 행만 버리면 **통과 대상은 하나도 안 샌다.**
+
+    🔴 상수로 박지 않는 이유: project 가 늘면 이 값도 같이 내려가야 한다. 박아 두면
+    새 project 가 생긴 날 조용히 문서를 잃는다.
+    """
+    projects = len(projects_for(wiki))
+    return -(-min_views // projects)          # 올림 나눗셈
+
+
+def scan_titles(lines: Iterable[str], wiki: str, *, min_views: int) -> frozenset[str]:
+    """1패스 — 행 하나라도 `safe_row_floor` 이상인 canonical 제목만 모은다.
+
+    ⚠️ **왜 두 번 읽나.** 한 시간 파일은 enwiki ns0 만 약 236만 행이다(2026-09-21
+    15:00Z 실측). 전부 dict 에 담으면 `live-cycle` 컨테이너 상한(1g)에 위험하다.
+    1패스로 제목을 좁히면(같은 시간 13,250개) 2패스 dict 이 작아진다.
+
+    🔴 **1패스에서 걸러 놓고 그 제목만 2패스로 정확히 합산해야 한다.** 1패스 결과를
+    그대로 합계로 쓰면 버려진 형제 행만큼 **조용히 적게** 나온다 — 예를 들어
+    데스크톱 40 · 모바일 70 인 문서는 70 으로 적재돼 하한 100 을 못 넘는다.
+    gzip 두 번 해제는 약 1초다(45MB 기준) — 메모리·정확성과 바꿀 만하다.
+    """
+    projects = projects_for(wiki)
+    floor = safe_row_floor(wiki, min_views)
+    keep: set[str] = set()
+    for line in lines:
+        if not line.strip():
+            continue
+        parsed = parse_row(line, projects)
+        if parsed is None:
+            continue
+        title, views, _is_mobile = parsed
+        if views >= floor:
+            keep.add(title)
+    return frozenset(keep)
+
+
+def aggregate(
+    lines: Iterable[str],
+    wiki: str,
+    ts_hour: str,
+    *,
+    titles: frozenset[str] | None = None,
+    min_views: int | None = None,
+    candidates: frozenset[str] | None = None,
+) -> Iterator[PageviewHourly]:
+    """한 시간 파일을 (wiki, title, ts_hour, views, mobile_views) 로 합산한다.
+
+    데스크톱(`en`)과 모바일(`en.m`)이 한 문서당 각각 한 행이라 합쳐진다.
+    🔴 **합치되 모바일 몫을 따로 남긴다** (S15P21A609-210). 예전에는 합산만 하고
+    버렸는데, 그 비율이 봇 트래픽과 실제 사건을 가르는 유일한 신호다. 여기서 버리면
+    다시 얻으려고 AQS 를 문서마다 때려야 한다 — 같은 파일 안에 이미 있는 값이다.
+
+    `titles` 를 주면 그 문서만 남긴다(canonical 공백형으로 비교). ⚠️ **전체를 그대로
+    적재하지 않는 이유**: enwiki ns0 만 시간당 약 190만 행이라 하루 4,500만 행이고,
+    고정 2개월이면 28억 행이다. 2단계 계약에서 조회수를 봐야 하는 건 1단계(사람 편집
+    1건 이상)를 통과한 문서뿐이므로, 그 후보 집합으로 거르는 게 정상 경로다.
+    필터 없이 부르면 전부 나온다 — 품질 측정·전수 비교용이다.
+
+    `min_views` 를 주면 **합계가 그 값 이상인 문서도 함께** 남긴다 (S15P21A609-212).
+    후보 집합만 남기면 `page_baseline` 을 만들 이력이 안 쌓이기 때문이다 — 기준선은
+    `(문서, 시간대)` 별로 28일치가 필요한데, "그 시간에 편집이 있던 날" 의 조회수만
+    있으면 `sample_days` 가 1 근처에서 멈춘다(`-162` 가 replay 에서 겪은 그 문제).
+
+    🔴 **세 인자의 역할이 다르다. 섞으면 조용히 틀린다.**
+
+        titles      **읽을** 제목 (합산 대상). `scan_titles()` 결과 ∪ 후보를 넘긴다
+        min_views   **남길** 하한. 합계가 이 값 미만이면 버린다
+        candidates  하한과 **무관하게 남길** 제목. 후보 대기가 여기 들어간다
+
+    ⚠️ `candidates` 가 따로 있는 이유: `titles` 는 이미 둘을 합친 집합이라, 그걸로
+    "후보라서 남긴다" 를 판정하면 **하한이 통째로 무력화된다** — 합산된 제목이 전부
+    `titles` 안에 있으니 아무것도 안 걸러진다. 실제로 테스트가 이걸 잡았다.
+
+    ⚠️ 후보 문서는 하한을 못 넘어도 남겨야 한다. 그 값으로 재판정을 해야 하고,
+    빠지면 그 대기가 영영 안 풀린다.
+    """
+    projects = projects_for(wiki)
+    acc: dict[str, int] = {}
+    mobile: dict[str, int] = {}
+    for line in lines:
+        if not line.strip():
+            continue
+        parsed = parse_row(line, projects)
+        if parsed is None:
+            continue
+        title, views, is_mobile = parsed
+        if titles is not None and title not in titles:
+            continue
+        acc[title] = acc.get(title, 0) + views
+        if is_mobile:
+            mobile[title] = mobile.get(title, 0) + views
+
+    for title, views in acc.items():
+        # 🔴 하한은 **합계**로 본다. 행 단위로 보면 데스크톱 40 · 모바일 70 인 문서가
+        #    빠진다 — `scan_titles` 의 행 문턱은 후보를 좁히는 용도일 뿐이고,
+        #    통과 판정은 여기서 한 번만 한다.
+        if (min_views is not None
+                and views < min_views
+                and not (candidates is not None and title in candidates)):
+            continue
+        yield PageviewHourly(wiki=wiki, title=title, ts_hour=ts_hour, views=views,
+                             mobile_views=mobile.get(title, 0))

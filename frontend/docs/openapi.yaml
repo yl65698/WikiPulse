@@ -1,0 +1,1197 @@
+openapi: 3.0.3
+info:
+  title: WikiPulse implemented read APIs
+  version: 1.0.0-backend
+  description: >-
+    Ten GET routes verified against Spring controllers and DTOs (eight at f3c0160, 2026-09-15, S15P21A609-95/-97; /stocks/{ticker}/prices added 2026-09-18, S15P21A609-124; /issues/rankings added 2026-09-22, S15P21A609-198).
+    This replaces the 0.2.0 frontend proposal. Unimplemented APIs and contract decisions are documented in
+    docs/frontend/API_DECISIONS.md. Mock uses these wire shapes; this document is not evidence of a live
+    deployment.
+servers:
+  - url: /api/v1
+paths:
+  /issues/rankings:
+    get:
+      operationId: getIssueRankings
+      description: >-
+        Rolling 30-day and one-calendar-year rankings ending at server time (Asia/Seoul).
+        Completed snapshots only; discard DISCARDED issues. Deduplicate by issue_key,
+        retain the highest score (ties: latest snapshot, then lowest id), and return ten
+        entries per window. Each id links to the snapshot that supplied its score.
+      responses:
+        "200":
+          description: Rankings; either list can be empty.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssueRankingsResponse"
+        "500":
+          description: Internal error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /issues:
+    get:
+      operationId: listIssues
+      description: >-
+        One resolved snapshot. Fixed pulseScore descending/id ascending order. No text or category search.
+        Null labels have no representativeTitle in this DTO.
+      parameters:
+        - name: snapshotTs
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+            pattern: Z$
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: source
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - live
+              - replay
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        "200":
+          description: Successful current Spring DTO response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssueListResponse"
+        "400":
+          description: Invalid supported query value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Resource not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /issues/{id}:
+    get:
+      operationId: getIssue
+      description: >-
+        Optional NON_NULL fields may be absent. relatedStocks is a preview of at most five. Member metrics
+        are fixed values copied into cluster_member for this issue snapshot; never substitute later raw rows.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/DatabaseId"
+      responses:
+        "200":
+          description: Successful current Spring DTO response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssueDetailResponse"
+        "400":
+          description: Invalid supported query value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Resource not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /issues/{id}/stocks:
+    get:
+      operationId: listIssueStocks
+      description: >-
+        Verified stocks, default 50/max 100. No offset, total or hasMore. Caller checks the parent issue
+        visibility; server parent DISCARDED guard remains a follow-up.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/DatabaseId"
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        "200":
+          description: Successful current Spring DTO response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelatedStocksResponse"
+        "400":
+          description: Invalid supported query value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Resource not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /stocks:
+    get:
+      operationId: listStocks
+      description: ""
+      parameters:
+        - name: q
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: sector
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: exchange
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: hasIssues
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        "200":
+          description: Successful current Spring DTO response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StockListResponse"
+        "400":
+          description: Invalid supported query value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Resource not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /stocks/{ticker}:
+    get:
+      operationId: getStock
+      description: Ticker is case-insensitive. No price or chart fields.
+      parameters:
+        - name: ticker
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful current Spring DTO response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StockDetailResponse"
+        "400":
+          description: Invalid supported query value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Resource not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /stocks/{ticker}/issues:
+    get:
+      operationId: listStockIssues
+      description: At most 50 visible verified-linked issue cards. No relation metadata or pagination in the current DTO.
+      parameters:
+        - name: ticker
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful current Spring DTO response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StockIssuesResponse"
+        "400":
+          description: Invalid supported query value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Resource not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /stocks/{ticker}/prices:
+    get:
+      operationId: getStockPrices
+      description: >-
+        Daily OHLC candles for the stock, trading days only, ascending by trade date.
+        Holidays have no point and are not interpolated. Query from/to are YYYY-MM-DD,
+        default is the most recent year. Unknown ticker is 404; an existing ticker with
+        no rows in the range is 200 with empty data. Issue markers are not merged in — the
+        client overlays them from /stocks/{ticker}/issues snapshotTs.
+      parameters:
+        - name: ticker
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+            pattern: ^\d{4}-\d{2}-\d{2}$
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+            pattern: ^\d{4}-\d{2}-\d{2}$
+      responses:
+        "200":
+          description: Daily candles in the range, ascending by trade date; empty when none.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StockPricesResponse"
+        "400":
+          description: Invalid supported query value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Resource not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /issues/snapshots:
+    get:
+      operationId: listSnapshots
+      parameters:
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+            pattern: Z$
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+            pattern: Z$
+        - name: source
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - live
+              - replay
+      responses:
+        "200":
+          description: Completed snapshots, including zero-cluster snapshots; unique by source and snapshotTs.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotResponse"
+  /issues/map:
+    get:
+      operationId: getPulseMap
+      parameters:
+        - name: snapshotTs
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+            pattern: Z$
+        - name: source
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - live
+              - replay
+      responses:
+        "200":
+          description: >-
+            Atomic graph from one completed snapshot; omitting timestamp selects latest LIVE, or latest replay
+            when no LIVE exists. Edges refer only to nodes within the same cluster.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MapResponse"
+        "404":
+          description: Requested snapshot does not exist; never substitute current data.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+components:
+  schemas:
+    IssueRankingsResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [asOf, monthFrom, yearFrom, monthly, yearly]
+          properties:
+            asOf:
+              type: string
+              format: date-time
+            monthFrom:
+              type: string
+              format: date-time
+            yearFrom:
+              type: string
+              format: date-time
+            monthly:
+              type: array
+              maxItems: 10
+              items:
+                $ref: "#/components/schemas/IssueRankingEntry"
+            yearly:
+              type: array
+              maxItems: 10
+              items:
+                $ref: "#/components/schemas/IssueRankingEntry"
+    IssueRankingEntry:
+      type: object
+      additionalProperties: false
+      required: [id, pulseScore]
+      properties:
+        id:
+          type: integer
+          minimum: 1
+        label:
+          type: string
+          nullable: true
+        pulseScore:
+          type: number
+          minimum: 0
+    Snapshot:
+      type: object
+      required:
+        - snapshotTs
+        - source
+        - clusterCount
+      properties:
+        snapshotTs:
+          type: string
+          format: date-time
+          pattern: Z$
+        source:
+          type: string
+          enum:
+            - live
+            - replay
+        clusterCount:
+          type: integer
+          minimum: 0
+      additionalProperties: false
+    SnapshotResponse:
+      type: object
+      required:
+        - data
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Snapshot"
+      additionalProperties: false
+    Node:
+      type: object
+      required:
+        - pageId
+        - wiki
+        - title
+        - isSeed
+        - editCount
+        - views
+        - editBaseline
+        - viewBaseline
+        - spikeScore
+        - sizeScore
+        - completeness
+        - windowStart
+        - windowEnd
+      properties:
+        pageId:
+          type: string
+          minLength: 1
+        wiki:
+          type: string
+          pattern: ^[a-z-]+wiki$
+        title:
+          type: string
+          minLength: 1
+        titleKo:
+          type: string
+          minLength: 1
+          nullable: true
+          description: "표시 전용 ko.wikipedia 대응 제목. ko 문서가 없으면 null이고 화면은 title(영문)로 떨어진다. title을 대체하지 않으며 위키백과 링크·식별자는 계속 title을 쓴다."
+        titleKoFallback:
+          type: string
+          minLength: 1
+          nullable: true
+          description: "표시 전용 기계 번역 제목(Azure Translator, en->ko). ko.wikipedia 정식 제목이 아니므로 위키 링크에 쓰지 않는다. 표시 우선순위는 titleKo > titleKoFallback > title."
+        isSeed:
+          type: boolean
+          description: >-
+            true면 최종 급증 관문을 직접 통과한 루트 문서 또는 생성 시각
+            동시성으로 편입된 새 사건 문서다. false면 Clickstream 이웃 중
+            사건기간 편집 재급증 기준을 통과한 기존 문서다. Wikidata는
+            멤버 편입 사유가 아니다.
+        editCount:
+          type: number
+          minimum: 0
+          nullable: true
+        views:
+          type: number
+          minimum: 0
+          nullable: true
+        editBaseline:
+          type: number
+          minimum: 0
+          nullable: true
+        viewBaseline:
+          type: number
+          minimum: 0
+          nullable: true
+        spikeScore:
+          type: number
+          minimum: 0
+          nullable: true
+        sizeScore:
+          type: number
+          minimum: 0
+          maximum: 1
+          nullable: true
+        completeness:
+          type: string
+          enum:
+            - complete
+            - pending
+            - unavailable
+        windowStart:
+          type: string
+          format: date-time
+          pattern: Z$
+        windowEnd:
+          type: string
+          format: date-time
+          pattern: Z$
+      additionalProperties: false
+    Evidence:
+      type: object
+      required:
+        - label
+      properties:
+        label:
+          type: string
+          minLength: 1
+        month:
+          type: string
+          pattern: ^\d{4}-(0[1-9]|1[0-2])$
+        observedAt:
+          type: string
+          format: date-time
+          pattern: Z$
+      additionalProperties: false
+    Edge:
+      type: object
+      required:
+        - id
+        - sourcePageId
+        - targetPageId
+        - kind
+        - directed
+        - weight
+        - evidence
+      properties:
+        id:
+          type: string
+          minLength: 1
+        sourcePageId:
+          type: string
+          minLength: 1
+        targetPageId:
+          type: string
+          minLength: 1
+        kind:
+          type: string
+          enum:
+            - clickstream
+            - wikidata
+        directed:
+          type: boolean
+        weight:
+          type: number
+          minimum: 0
+        evidence:
+          $ref: "#/components/schemas/Evidence"
+      additionalProperties: false
+    Cluster:
+      type: object
+      required:
+        - id
+        - issueKey
+        - label
+        - summary
+        - category
+        - firstDetectedAt
+        - hot
+        - pulseScore
+        - status
+        - memberCount
+        - nodes
+        - edges
+      properties:
+        id:
+          type: string
+          minLength: 1
+        issueKey:
+          type: string
+          nullable: true
+          description: >-
+            Legacy rows can omit the stable cross-snapshot identity. Do not infer continuity from a
+            snapshot-local id.
+        label:
+          type: string
+          nullable: true
+        summary:
+          type: string
+          minLength: 1
+          nullable: true
+        category:
+          type: string
+          enum:
+            - politics
+            - world
+            - society
+            - economy
+            - technology
+            - science
+            - culture
+            - sports
+            - environment
+            - other
+        firstDetectedAt:
+          type: string
+          format: date-time
+          pattern: Z$
+          nullable: true
+        hot:
+          type: boolean
+        pulseScore:
+          type: number
+          minimum: 0
+        status:
+          type: string
+          description: >-
+            이슈 판정 후 AI 보강 상태. DETECTED는 처리 전, VERIFYING은 처리 중,
+            CONFIRMED는 요약 생성과 종목 검증 작업 종료를 뜻한다. 관련 종목이
+            0개인 CONFIRMED는 모든 작업이 끝났을 때만 가능하다. GMS·GDELT 실패와
+            재시도는 VERIFYING으로 남긴다.
+          enum:
+            - DETECTED
+            - VERIFYING
+            - CONFIRMED
+        memberCount:
+          type: integer
+          minimum: 0
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/Node"
+        edges:
+          type: array
+          items:
+            $ref: "#/components/schemas/Edge"
+      additionalProperties: false
+    MapMeta:
+      type: object
+      required:
+        - snapshotTs
+        - source
+        - scoreVersion
+        - newWindowHours
+        - clusterCount
+        - nodeCount
+        - edgeCount
+        - truncated
+      properties:
+        snapshotTs:
+          type: string
+          format: date-time
+          pattern: Z$
+        source:
+          type: string
+          enum:
+            - live
+            - replay
+        dataMode:
+          type: string
+          minLength: 1
+        scoreVersion:
+          type: string
+          minLength: 1
+        newWindowHours:
+          type: number
+          exclusiveMinimum: true
+          minimum: 0
+        clusterCount:
+          type: integer
+          minimum: 0
+        nodeCount:
+          type: integer
+          minimum: 0
+        edgeCount:
+          type: integer
+          minimum: 0
+        truncated:
+          type: boolean
+      additionalProperties: false
+    MapResponse:
+      type: object
+      required:
+        - data
+        - meta
+      properties:
+        data:
+          type: object
+          required:
+            - clusters
+          properties:
+            clusters:
+              type: array
+              items:
+                $ref: "#/components/schemas/Cluster"
+          additionalProperties: false
+        meta:
+          $ref: "#/components/schemas/MapMeta"
+      additionalProperties: false
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+          properties:
+            code:
+              type: string
+              minLength: 1
+            message:
+              type: string
+              minLength: 1
+          additionalProperties: false
+      additionalProperties: false
+    DatabaseId:
+      type: integer
+      format: int64
+      minimum: 1
+      description: >-
+        Current Issue DTOs serialize Java long as JSON number. FE rejects unsafe JavaScript integers;
+        migration to string IDs is tracked in API_DECISIONS.md.
+    Pagination:
+      type: object
+      properties:
+        offset:
+          type: integer
+          minimum: 0
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        total:
+          type: integer
+          minimum: 0
+        hasMore:
+          type: boolean
+      required:
+        - offset
+        - limit
+        - total
+        - hasMore
+      additionalProperties: false
+    PageMeta:
+      type: object
+      properties:
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+        snapshotTs:
+          type: string
+          format: date-time
+          pattern: Z$
+      required:
+        - pagination
+      additionalProperties: false
+    IssueCard:
+      type: object
+      properties:
+        id:
+          $ref: "#/components/schemas/DatabaseId"
+        label:
+          type: string
+          nullable: true
+        pulseScore:
+          type: number
+          minimum: 0
+        status:
+          type: string
+          enum:
+            - DETECTED
+            - VERIFYING
+            - CONFIRMED
+            - DISCARDED
+        source:
+          type: string
+          enum:
+            - live
+            - replay
+        snapshotTs:
+          type: string
+          format: date-time
+          pattern: Z$
+        memberCount:
+          type: integer
+          minimum: 0
+        stockCount:
+          type: integer
+          minimum: 0
+      required:
+        - id
+        - label
+        - pulseScore
+        - status
+        - source
+        - snapshotTs
+        - memberCount
+        - stockCount
+      additionalProperties: false
+    IssueMember:
+      type: object
+      properties:
+        pageId:
+          $ref: "#/components/schemas/DatabaseId"
+        wiki:
+          type: string
+        title:
+          type: string
+        titleKo:
+          type: string
+          minLength: 1
+          nullable: true
+          description: "표시 전용 ko.wikipedia 대응 제목. ko 문서가 없으면 null이고 화면은 title(영문)로 떨어진다. title을 대체하지 않으며 위키백과 링크·식별자는 계속 title을 쓴다."
+        titleKoFallback:
+          type: string
+          minLength: 1
+          nullable: true
+          description: "표시 전용 기계 번역 제목(Azure Translator, en->ko). ko.wikipedia 정식 제목이 아니므로 위키 링크에 쓰지 않는다. 표시 우선순위는 titleKo > titleKoFallback > title."
+        weight:
+          type: number
+        isSeed:
+          type: boolean
+          description: >-
+            true면 최종 급증 관문을 직접 통과한 루트 문서 또는 생성 시각
+            동시성으로 편입된 새 사건 문서다. false면 Clickstream 이웃 중
+            사건기간 편집 재급증 기준을 통과한 기존 문서다.
+        editCount:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: Edit count used to evaluate this snapshot window.
+        views:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: Pageviews used to evaluate this snapshot window.
+        completeness:
+          type: string
+          enum:
+            - complete
+            - pending
+            - unavailable
+          description: >-
+            editCount/views 가 null 일 때 그 이유. complete 는 판정 완료,
+            pending 은 입력 대기, unavailable 은 그 시점 원본을 확보할 수 없음.
+            Node 와 같은 어휘다 (S15P21A609-129).
+      required:
+        - pageId
+        - wiki
+        - title
+        - weight
+        - isSeed
+      additionalProperties: false
+    RelatedStock:
+      type: object
+      properties:
+        ticker:
+          type: string
+        name:
+          type: string
+        exchange:
+          type: string
+          nullable: true
+        sector:
+          type: string
+          nullable: true
+        tier:
+          type: string
+          enum:
+            - BOTH
+            - GDELT_ONLY
+            - EMBEDDING_ONLY
+        matchPath:
+          type: string
+          enum:
+            - DIRECT_MENTION
+            - PRODUCT_INDUSTRY
+            - SUPPLY_CHAIN
+            - REGION
+          nullable: true
+        similarity:
+          type: number
+          nullable: true
+        gdeltLift:
+          type: number
+          nullable: true
+        rationale:
+          type: string
+          nullable: true
+      required:
+        - ticker
+        - name
+        - tier
+      additionalProperties: false
+    IssueDetail:
+      type: object
+      properties:
+        id:
+          $ref: "#/components/schemas/DatabaseId"
+        label:
+          type: string
+          nullable: true
+        pulseScore:
+          type: number
+          minimum: 0
+        status:
+          type: string
+          enum:
+            - DETECTED
+            - VERIFYING
+            - CONFIRMED
+            - DISCARDED
+        source:
+          type: string
+          enum:
+            - live
+            - replay
+        snapshotTs:
+          type: string
+          format: date-time
+          pattern: Z$
+        summary:
+          type: string
+          nullable: true
+        summaryModel:
+          type: string
+          nullable: true
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/IssueMember"
+        relatedStocks:
+          type: array
+          items:
+            $ref: "#/components/schemas/RelatedStock"
+      required:
+        - id
+        - pulseScore
+        - status
+        - source
+        - snapshotTs
+        - members
+        - relatedStocks
+      additionalProperties: false
+    StockCard:
+      type: object
+      properties:
+        ticker:
+          type: string
+        name:
+          type: string
+        exchange:
+          type: string
+          nullable: true
+        sector:
+          type: string
+          nullable: true
+        issueCount:
+          type: integer
+          minimum: 0
+        lastClose:
+          type: number
+          minimum: 0
+          nullable: true
+          description: >-
+            Latest trading-day close (price column, S15P21A609-189). null when the
+            stock has no daily candle; FE renders "미제공". stock_price.close is
+            NUMERIC(14,4), serialized as a JSON number.
+      required:
+        - ticker
+        - name
+        - exchange
+        - sector
+        - issueCount
+        - lastClose
+      additionalProperties: false
+    StockDetail:
+      type: object
+      properties:
+        ticker:
+          type: string
+        name:
+          type: string
+        exchange:
+          type: string
+          nullable: true
+        cik:
+          type: string
+          nullable: true
+        sector:
+          type: string
+          nullable: true
+        businessSummary:
+          type: string
+          nullable: true
+      required:
+        - ticker
+        - name
+      additionalProperties: false
+    IssueListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/IssueCard"
+        meta:
+          $ref: "#/components/schemas/PageMeta"
+      required:
+        - data
+        - meta
+      additionalProperties: false
+    IssueDetailResponse:
+      type: object
+      properties:
+        data:
+          $ref: "#/components/schemas/IssueDetail"
+      required:
+        - data
+      additionalProperties: false
+    RelatedStocksResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/RelatedStock"
+      required:
+        - data
+      additionalProperties: false
+    StockListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/StockCard"
+        meta:
+          $ref: "#/components/schemas/PageMeta"
+      required:
+        - data
+        - meta
+      additionalProperties: false
+    StockDetailResponse:
+      type: object
+      properties:
+        data:
+          $ref: "#/components/schemas/StockDetail"
+      required:
+        - data
+      additionalProperties: false
+    StockIssuesResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/IssueCard"
+      required:
+        - data
+      additionalProperties: false
+    StockPrice:
+      type: object
+      description: >-
+        One daily candle. Trading days only. close is server NOT NULL; open/high/low/volume
+        may be null when yfinance omitted them. Raw (unadjusted) prices.
+      properties:
+        tradeDate:
+          type: string
+          format: date
+          pattern: ^\d{4}-\d{2}-\d{2}$
+        open:
+          type: number
+          minimum: 0
+          nullable: true
+        high:
+          type: number
+          minimum: 0
+          nullable: true
+        low:
+          type: number
+          minimum: 0
+          nullable: true
+        close:
+          type: number
+          minimum: 0
+        volume:
+          type: integer
+          format: int64
+          minimum: 0
+          nullable: true
+      required:
+        - tradeDate
+        - open
+        - high
+        - low
+        - close
+        - volume
+      additionalProperties: false
+    StockPricesResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/StockPrice"
+      required:
+        - data
+      additionalProperties: false

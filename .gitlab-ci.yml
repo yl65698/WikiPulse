@@ -1,0 +1,432 @@
+# WikiPulse CI/CD
+#
+# 러너 (둘 다 EC2 1번 = 서비스 서버)
+#   ec2-docker : docker executor. image 로 툴체인을 가져와 호스트를 안 건드린다.
+#   ec2-shell  : shell executor. 호스트에서 직접 실행 — 배포 전용.
+ 
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - when: never
+ 
+stages: [test, build, deploy, verify]
+
+# Real HTTP/browser auth and bookmark tests against a temporary PostgreSQL cluster.
+test:accounts:
+  stage: test
+  image: node:24-bookworm
+  timeout: 20m
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == "develop"'
+      changes:
+        - backend/**/*
+        - frontend/**/*
+        - db/**/*
+        - docker/migrate/**/*
+        - docker/postgres/**/*
+        - docker-compose.yml
+        - tools/test_account_e2e.py
+        - tools/test_local_migrations.py
+        - .gitlab-ci.yml
+  variables:
+    GRADLE_USER_HOME: "$CI_PROJECT_DIR/.gradle"
+  script:
+    - apt-get update && apt-get install -y --no-install-recommends openjdk-17-jdk-headless python3-venv
+    - python3 -m venv /tmp/account-e2e-venv
+    - /tmp/account-e2e-venv/bin/pip install pgserver==0.1.4 "psycopg[binary]==3.3.5"
+    - (cd backend && chmod +x gradlew && ./gradlew bootJar --no-daemon)
+    - (cd frontend && npm ci && npx playwright install --with-deps chromium)
+    - /tmp/account-e2e-venv/bin/python tools/test_local_migrations.py
+    - (cd frontend && npx playwright test e2e/auth.spec.js)
+    - /tmp/account-e2e-venv/bin/python tools/test_account_e2e.py --browser
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - output/account-e2e/
+      - frontend/test-results/accounts/
+ 
+default:
+  tags: [ec2-docker]
+  interruptible: true
+ 
+variables:
+  GIT_DEPTH: "20"
+ 
+# ---------------------------------------------------------------- 경로 묶음
+# . 로 시작하면 잡이 아니라 재사용용 조각이다.
+# ⚠️ 폴더만 보고 자르면 안 된다 — db/migrations 가 바뀌면 backend 도 검증해야 한다
+#    (ddl-auto: validate). 안 그러면 조용히 안 도는 테스트가 생긴다.
+.paths_backend: &paths_backend
+  - backend/**/*
+  - db/migrations/**/*
+  # 🔴 compose 를 고쳤는데 배포가 안 돌면 서버는 옛 파일 그대로다 (S15P21A609-179).
+  - infra/service/compose.yaml
+  - .gitlab-ci.yml
+ 
+.paths_db: &paths_db
+  - db/**/*
+  - .gitlab-ci.yml
+ 
+.paths_pipeline: &paths_pipeline
+  - data-pipeline/**/*
+  - db/migrations/**/*               # 스키마가 바뀌면 DB 왕복 테스트도 다시 돌아야 한다
+  - .gitlab-ci.yml
+ 
+.paths_frontend: &paths_frontend
+  - frontend/**/*
+  - .gitlab-ci.yml
+
+# 🔴 기존 앵커 어느 것도 infra/ 와 루트 compose 를 안 본다 — 거기에 얹으면 정작 문제가
+#    생기는 변경에서 검사가 안 돈다. 그래서 앵커를 따로 둔다 (S15P21A609-168).
+.paths_config: &paths_config
+  - backend/src/main/resources/application.yml
+  - infra/service/compose.yaml
+  - docker-compose.yml
+  - tools/check_compose_env.py
+  - .gitlab-ci.yml
+ 
+# ================================================================ test
+# MR 에서 한 번, develop 머지 결과에서 한 번 돈다 (S15P21A609-131).
+test:backend:
+  stage: test
+  image: eclipse-temurin:17-jdk
+  rules:
+    # MR 에서 한 번, develop 머지 결과에서 한 번 (S15P21A609-131).
+    # 🔴 MR 파이프라인은 소스 브랜치만 본다 — develop 과 합쳐진 상태는 안 본다.
+    #    2026-09-18 에 MR 두 개가 각자 통과하고 develop 에서 만나 빌드가 깨졌다.
+    #    merged results 파이프라인은 Premium 이라 못 쓰므로 develop 푸시에서 다시 돈다.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *paths_backend
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      changes: *paths_backend
+  variables:
+    # 🔴 GRADLE_USER_HOME 을 프로젝트 안으로 옮겨야 캐시에 담긴다.
+    #    기본값(~/.gradle)은 컨테이너와 함께 사라진다.
+    GRADLE_USER_HOME: "$CI_PROJECT_DIR/.gradle"
+  cache:
+    key:
+      files: [backend/build.gradle]
+    paths:
+      - .gradle/caches
+      - .gradle/wrapper
+  script:
+    - cd backend
+    - chmod +x gradlew
+    - ./gradlew test --no-daemon
+ 
+# 노브를 더해 놓고 compose 에 안 적으면 `.env` 에 값을 넣어도 컨테이너 안에 안 들어간다.
+# 조용히 애플리케이션 기본값으로 떨어져서 "켰는데 아무 일도 안 일어난다"로 보인다.
+# -142 와 -168 에서 두 번 물렸다. 의존성이 없어 수십 밀리초면 끝난다.
+test:config:
+  stage: test
+  image: python:3.11-slim
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *paths_config
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      changes: *paths_config
+  script:
+    - python tools/check_compose_env.py
+
+test:db:
+  stage: test
+  image: python:3.11-slim
+  rules:
+    # MR 에서 한 번, develop 머지 결과에서 한 번 (S15P21A609-131).
+    # 🔴 MR 파이프라인은 소스 브랜치만 본다 — develop 과 합쳐진 상태는 안 본다.
+    #    2026-09-18 에 MR 두 개가 각자 통과하고 develop 에서 만나 빌드가 깨졌다.
+    #    merged results 파이프라인은 Premium 이라 못 쓰므로 develop 푸시에서 다시 돈다.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *paths_db
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      changes: *paths_db
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip"
+  cache:
+    key:
+      files: [db/requirements-test.txt]
+    paths: [.pip]
+  script:
+    # pgserver 가 PostgreSQL 을 번들로 띄운다 — 별도 DB 서비스가 필요 없다.
+    # migrations/V*.sql 을 버전 순서대로 적재하므로 마이그레이션 자체를 검증한다.
+    - pip install -r db/requirements-test.txt
+    - cd db
+    - pytest -q
+ 
+test:pipeline:
+  stage: test
+  image: python:3.11-slim          # 🔴 3.12+ 에서는 PySpark 3.5 워커가 죽는다
+  rules:
+    # MR 에서 한 번, develop 머지 결과에서 한 번 (S15P21A609-131).
+    # 🔴 MR 파이프라인은 소스 브랜치만 본다 — develop 과 합쳐진 상태는 안 본다.
+    #    2026-09-18 에 MR 두 개가 각자 통과하고 develop 에서 만나 빌드가 깨졌다.
+    #    merged results 파이프라인은 Premium 이라 못 쓰므로 develop 푸시에서 다시 돈다.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *paths_pipeline
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      changes: *paths_pipeline
+  # 실 PostgreSQL 을 붙인다 (S15P21A609-131). ~~psycopg 를 일부러 안 깐다~~ 였는데,
+  # 그러면 DB 왕복 테스트가 importorskip 으로 조용히 건너뛴다 — 잡은 초록색인데 아무것도
+  # 검증하지 않는 상태가 된다. pgvector 가 필요한 건 cluster 임베딩 테스트 때문이다.
+  services:
+    - name: pgvector/pgvector:0.8.6-pg17-bookworm
+      alias: postgres
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip"
+    POSTGRES_DB: wikipulse
+    POSTGRES_USER: wikipulse
+    POSTGRES_PASSWORD: wikipulse
+    DATABASE_URL: "postgresql://wikipulse:wikipulse@postgres:5432/wikipulse"
+  cache:
+    key: pipeline-pip
+    paths: [.pip]
+  script:
+    # ⚠️ pyspark 는 여전히 안 깐다 — 300 MB + JVM 이라 t3 버스트 러너에 무겁다.
+    #    Spark 가 필요한 파일(streaming 대조·baseline Spark)은 계속 건너뛴다.
+    #    `-ra` 로 건너뛴 이유를 로그에 남겨, 안 도는 게 늘어나면 보이게 한다.
+    # pandas 는 stock 테스트가 쓴다 — 로컬 venv 에 우연히 있어서 안 보이던 의존성이다.
+    # ⚠️ confluent-kafka 도 깐다. producer/wiki_edits.py 가 모듈 최상단에서 임포트해서
+    #    없으면 tests/test_wiki_edits.py 가 collection 단계에서 죽는다 — pandas 때와
+    #    같은 함정이다(로컬 venv 에 우연히 있어서 안 보인다, 2026-09-19 CI 실측).
+    - pip install pytest==8.3.4 requests==2.32.3 "psycopg[binary]==3.3.5" pgserver==0.1.4 pandas==3.0.5 confluent-kafka==2.6.1
+    # 스키마를 먼저 만든다. CI·배포가 같은 스크립트를 쓴다(db/apply_migrations.py).
+    - python db/apply_migrations.py
+    - cd data-pipeline
+    - pytest -q -ra
+    # 🔴 ~~루트·batch·gdelt 만 돌렸다~~ → spike·cluster·gkg·stock 이 빠져 있었다
+    #    (S15P21A609-131). 2026-09-18 의 -127·-128·-129 변경 대부분이 그 두 곳이다.
+    # ⚠️ 서브셸로 들어간다. `cd X && ... && cd ..` 는 실패했을 때 `cd ..` 가 안 돌아서
+    #    다음 줄이 엉뚱한 디렉터리에서 실행된다 — 실제로 그렇게 오진했다(2026-09-18).
+    - (cd batch && pytest -q -ra)
+    - (cd spike && pytest -q -ra)
+    - (cd cluster && pytest -q -ra)
+    - (cd gkg && pytest -q -ra)
+    - (cd stock && pytest -q -ra)
+    - (cd gdelt && pytest -q -ra)
+
+test:pipeline-spark:
+  stage: test
+  image: python:3.11-slim-bookworm
+  rules:
+    # MR 에서 한 번, develop 머지 결과에서 한 번 (S15P21A609-131 과 같은 이유).
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *paths_pipeline
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      changes: *paths_pipeline
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip"
+  cache:
+    key: pipeline-spark-pip
+    paths: [.pip]
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends openjdk-17-jre-headless
+  script:
+    # 🔴 위 test:pipeline 은 pyspark 를 안 깐다. streaming 계획 회귀는 실제 Spark 가
+    #    없으면 조용히 skip 되므로 이 잡 하나만 따로 돌린다. Windows 로컬에서는
+    #    writeStream 에 필요한 Hadoop native DLL 이 없어 같은 테스트가 skip 된다.
+    - pip install pytest==8.3.4 pyspark==3.5.3
+    - cd data-pipeline
+    - pytest -q tests/test_edit_windows.py::test_live_pipeline_does_not_crash_when_planning_second_micro_batch
+
+test:frontend:
+  stage: test
+  image: node:20-alpine
+  rules:
+    # MR 에서 한 번, develop 머지 결과에서 한 번 (S15P21A609-131).
+    # 🔴 MR 파이프라인은 소스 브랜치만 본다 — develop 과 합쳐진 상태는 안 본다.
+    #    2026-09-18 에 MR 두 개가 각자 통과하고 develop 에서 만나 빌드가 깨졌다.
+    #    merged results 파이프라인은 Premium 이라 못 쓰므로 develop 푸시에서 다시 돈다.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *paths_frontend
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      changes: *paths_frontend
+  variables:
+    # npm ci 는 node_modules 를 지우고 시작하므로 그걸 캐시해도 소용없다.
+    # 다운로드 캐시를 담아야 --prefer-offline 이 먹는다.
+    npm_config_cache: "$CI_PROJECT_DIR/.npm"
+  cache:
+    key:
+      files: [frontend/package-lock.json]
+    paths: [.npm]
+  script:
+    - cd frontend
+    - npm ci --prefer-offline --no-audit --fund=false
+    - npm run lint
+    - npm run test:data
+ 
+# ================================================================ build (develop)
+build:frontend:
+  stage: build
+  image: node:20-alpine
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      changes: *paths_frontend
+  variables:
+    npm_config_cache: "$CI_PROJECT_DIR/.npm"
+    # 🔴 VITE_* 는 빌드 시점에 번들에 박힌다. 실행 시점에 못 바꾼다.
+    #    여기서 빠뜨리면 mock 데이터로 빌드돼 화면이 조용히 가짜가 된다.
+    VITE_DATA_SOURCE: api
+    VITE_API_BASE_URL: /api/v1
+  cache:
+    key:
+      files: [frontend/package-lock.json]
+    paths: [.npm]
+  script:
+    - cd frontend
+    - npm ci --prefer-offline --no-audit --fund=false
+    - npm run build
+  artifacts:
+    paths: [frontend/dist]
+    expire_in: 1 week
+ 
+# ================================================================ deploy (develop, 자동)
+# 🔴 tags: [ec2-shell] — 호스트에서 실행돼야 파일을 놓고 compose 를 띄울 수 있다.
+#    docker 러너로 가면 컨테이너 안이라 /home/ubuntu 가 아예 없다.
+# 🔴 interruptible: false — 배포 중간에 끊기면 반쯤 바뀐 상태로 남는다.
+# 🔴 resource_group — MR 두 개가 연달아 머지될 때 배포가 겹치지 않게 큐에 세운다.
+deploy:frontend:
+  stage: deploy
+  tags: [ec2-shell]
+  interruptible: false
+  resource_group: production
+  needs:
+    - job: build:frontend
+      optional: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      changes: *paths_frontend
+  variables:
+    TARGET: /home/ubuntu/infra/service/frontend/dist
+  script:
+    # ⚠️ TARGET 이 비면 rm -rf /* 가 된다. 존재부터 확인한다.
+    - test -d "$TARGET"
+    # 직전 버전을 남긴다. 롤백: rm -rf dist/* && cp -r dist.prev/. dist/
+    - rm -rf "$TARGET.prev" && cp -r "$TARGET" "$TARGET.prev" || true
+    - rm -rf "$TARGET"/*
+    # ⚠️ cp -a 는 -p 를 포함해 대상 폴더의 타임스탬프까지 바꾸려다 권한 오류가 난다.
+    #    정적 파일이라 속성 보존이 필요 없다.
+    - cp -r frontend/dist/. "$TARGET"/
+    - ls -la "$TARGET" | head
+  environment:
+    name: production
+    url: https://j15a609.p.ssafy.io
+ 
+# 🔴 배포 드리프트 감지 (S15P21A609-193).
+#
+# 2026-09-22 에 실제로 터졌다. -191(backend+db) 머지 55초 뒤 프론트 MR 이 머지되면서
+# 앞 파이프라인의 deploy:backend 가 **시작도 전에** 취소됐고(canceled), 후속 파이프라인은
+# 프론트만 바뀌어 deploy:backend 를 아예 만들지 않았다. V13 이 운영에 없는 채로
+# **파이프라인은 초록**이었다 — 실패한 잡도 건너뛴 잡도 없다.
+#
+# 🔴 `interruptible: false` 로는 못 막는다. 그건 이미 배포 잡에 걸려 있는데, 아직
+#    **시작하지 않은** 잡은 그래도 취소된다. test 스테이지가 도는 동안 뒤 파이프라인이
+#    들어오면 그대로 당한다.
+#
+# 그래서 "막는" 대신 "드러나게" 한다. changes: 를 걸지 않아 **모든 develop 파이프라인**에서
+# 돌고, 저장소에 있는데 DB 에 없는 마이그레이션이 하나라도 있으면 빨갛게 뜬다.
+#
+# ⚠️ 이 잡은 아무것도 바꾸지 않는다(--fail-if-pending 이 dry-run 을 포함한다).
+#    고치는 것은 deploy:backend 의 apply-migrations.sh 다.
+# 🔴 **deploy 뒤 stage 다.** 같은 stage 에 두면 deploy:backend 보다 먼저 돌아,
+#    V13 을 적용하려는 바로 그 파이프라인을 실패시킨다.
+#    needs 로 묶지 않은 이유는 deploy:backend 가 없는 파이프라인(프론트만 바뀐 경우)이
+#    바로 이 잡이 잡아야 할 상황이기 때문이다 — optional needs 로 두면 그때 즉시 돌지만
+#    stage 순서가 더 읽기 쉽다.
+check:migrations:
+  stage: verify
+  tags: [ec2-shell]
+  interruptible: false
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+  script:
+    - bash infra/apply-migrations.sh --fail-if-pending
+
+deploy:backend:
+  stage: deploy
+  tags: [ec2-shell]
+  interruptible: false
+  resource_group: production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      changes: *paths_backend
+  script:
+    # 🔴 스키마를 먼저 맞춘다 (S15P21A609-133). ~~"확인할 것" 경고만 찍었다~~ → 사람이 잊는다.
+    #    2026-09-18 에 EC2 만 V7~V9 가 빠진 채 돌고 있었고, 백엔드 롤에는 권한이 하나도
+    #    없어서 이슈 API 가 전부 500 이었다. 둘 다 배포 경로에 없어서 아무도 몰랐다.
+    #    apply_migrations 는 이력 테이블(schema_migration)을 보고 남은 것만 적용하므로
+    #    매 배포에서 돌려도 안전하고, 권한은 앞으로 만들 테이블까지 덮는다.
+    #    ⚠️ ec2-shell 러너 호스트에는 psycopg 가 없다 — 컨테이너로 돌린다.
+    #    ⚠️ 이력이 없던 DB 는 첫 배포 전에 한 번 `--baseline N` 을 손으로 돌린다(infra/README.md).
+    - bash infra/apply-migrations.sh
+    # backend/Dockerfile 이 안에서 gradle 빌드까지 한다 — 별도 아티팩트가 필요 없다.
+    - docker build -t wikipulse-backend:$CI_COMMIT_SHORT_SHA -f backend/Dockerfile backend
+    # 🔴 저장소가 compose 의 정본이다 (S15P21A609-179). 배포는 서버 파일을 쓰는데
+    #    동기화 수단이 없어서 조용히 낡는다 — 2026-09-21 에 서버 31줄 / 저장소 51줄이었고
+    #    -165·-172·-176 변수가 통째로 빠져 있었다. 기본값이 우연히 같아 아무도 몰랐다.
+    #    ⚠️ 기본값이 다른 노브였다면(예: -168 의 *_SOURCE) `.env` 에 값을 넣어도
+    #       에러 없이 무시된다. 그 유형은 사람이 알아채는 경로가 없다.
+    # ⚠️ 서버에만 있던 손수정은 덮인다. 그게 의도지만 **diff 로 드러나야** 한다 —
+    #    안 보이면 이 단계가 또 다른 조용한 실패가 된다.
+    # 🔴 cp 가 아니라 `cat >` 다. 기존 inode 에 써 넣어 소유권·권한이 남는다(-178 실측).
+    - |
+      SERVER_COMPOSE=/home/ubuntu/infra/service/compose.yaml
+      if diff -q --strip-trailing-cr "$SERVER_COMPOSE" infra/service/compose.yaml >/dev/null 2>&1; then
+        echo "compose 동일 — 교체 없음"
+      else
+        echo "--- compose 차이 (서버 → 저장소) ---"
+        diff -u --strip-trailing-cr "$SERVER_COMPOSE" infra/service/compose.yaml || true
+        cp -p "$SERVER_COMPOSE" "$SERVER_COMPOSE.bak-$(date +%Y%m%d-%H%M%S)"
+        cat infra/service/compose.yaml > "$SERVER_COMPOSE"
+        echo "저장소 정본으로 교체했다 (백업 보관)"
+      fi
+    - cd /home/ubuntu/infra/service
+    # 교체한 파일이 유효한지 먼저 본다 — 깨진 compose 로 up 하면 서비스가 내려간다.
+    - docker compose config >/dev/null
+    - BACKEND_IMAGE=wikipulse-backend:$CI_COMMIT_SHORT_SHA docker compose up -d backend
+    # ddl-auto: validate 통과 여부 = 기동 성공 여부. 여기서 실패하면 스키마 불일치다.
+    #
+    # 🔴 ~~sleep 20 뒤 한 번 때린다~~ → **재시도 폴링** (S15P21A609-174).
+    #    2026-09-21 파이프라인 212498 이 **성공한 배포인데 빨갛게 떴다** — 기동에 25.0초가
+    #    걸려 20초 대기 뒤의 단발 호출이 5초 차이로 떨어졌다. 컨테이너·API·actuator 모두
+    #    정상이었다. 같은 날 직전 배포(211808)는 통과했다.
+    #
+    # ⚠️ **간헐적이라 더 나쁘다.** EC2 가 t3 버스트라 CPU 크레딧 잔량에 따라 기동 시간이
+    #    흔들린다 — 같은 코드가 어떤 날은 통과하고 어떤 날은 떨어진다. 성공한 배포가
+    #    빨갛게 뜨면 **진짜 실패와 구분이 안 되고**, 다음에 정말 깨져도 무시하게 된다.
+    #
+    # 🔴 상한을 없애지 않는다. 영원히 기다리면 깨진 배포가 러너를 물고 있다.
+    # ⚠️ 성공 시 `exit 0` 으로 끝내지 않는다 — 잡 전체가 거기서 끝나므로 나중에 이 뒤에
+    #    단계를 추가하면 **조용히 건너뛴다.** 플래그로 빠져나온다.
+    - |
+      ok=0
+      for i in $(seq 1 24); do   # 5초 × 24 = 최대 2분
+        if docker run --rm --network wikipulse-net curlimages/curl:latest \
+             -sf http://backend:8080/actuator/health >/dev/null; then
+          ok=1
+          echo "health OK (${i}번째 시도, 약 $((i * 5))초)"
+          break
+        fi
+        sleep 5
+      done
+      if [ "$ok" -ne 1 ]; then
+        echo "health check 2분 내 실패 — 아래 로그를 본다"
+        docker compose ps
+        docker compose logs --tail 80 backend
+        exit 1
+      fi
+    # 🔴 배포마다 wikipulse-backend:<SHA> 가 하나씩 쌓인다 (S15P21A609-201).
+    #    자동 배포로 바꾼 뒤로는 백엔드를 건드릴 때마다 늘어나 디스크를 먹는다.
+    #    최근 2개만 남긴다 — 롤백 여지는 두되 무한정 쌓이지는 않게.
+    #    ⚠️ health check **뒤에** 둔다. 배포가 실패하면 정리가 안 돌아 옛 이미지가 남는다.
+    #    ⚠️ `|| true` — 배포는 성공했는데 정리 실패로 잡이 빨개지면 오해를 부른다.
+    #       지금 돌고 있는 이미지는 docker 가 거부하므로(image is being used) 안전하다.
+    - |
+      docker images wikipulse-backend --format '{{.CreatedAt}}\t{{.Repository}}:{{.Tag}}' \
+        | sort -r | tail -n +3 | cut -f2 | xargs -r docker rmi || true
+    - docker image prune -f || true
+    - docker images wikipulse-backend
+  environment:
+    name: production
+    url: https://j15a609.p.ssafy.io
